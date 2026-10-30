@@ -1,0 +1,11 @@
+.env
+.venv/
+network.db
+network.db-*
+__pycache__/
+*.pyc
+.DS_Store
+backups/
+.pytest_cache/
+*.db
+*.db-*
