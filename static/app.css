@@ -3,3 +3,5 @@
 .panel{min-width:0}.post-card h3{font-size:15px}.post-excerpt{font-size:12px}.ai-reason{font-size:11px}.post-meta{font-size:10px}.post-bottom .open-post{font-size:11px}.metric-label{font-size:12px}.metric>small{font-size:11px}nav a{font-size:13px}.panel-description{font-size:12px}.pipeline strong{font-size:12px}.pipeline small{font-size:10px}.panel-heading h2{line-height:1.5}.channel-brief{font-size:13px}.quiet-note{font-size:11px}
 @media(max-width:950px){nav a{font-size:0}.overview-grid{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:650px){.pipeline{gap:4px}.pipeline>i{display:none}.pipeline strong{font-size:10px;overflow-wrap:anywhere;max-width:100%}.pipeline small{font-size:9px;overflow-wrap:anywhere}.pipeline-panel .panel-heading{align-items:flex-start;flex-direction:column}.metric-label{font-size:10px}.metric>small{font-size:10px}.post-card h3{font-size:15px}.post-excerpt{font-size:12px}.post-meta{font-size:10px}.quiet-note{font-size:11px}.panel-description{font-size:12px}}
+
+.ai-reason{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.editor-verdict p{overflow-wrap:anywhere}

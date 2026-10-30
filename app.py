@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy
+from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -48,7 +48,7 @@ def init():
         if 'image_approved' not in columns: con.execute('ALTER TABLE posts ADD COLUMN image_approved INTEGER DEFAULT 0')
         new_automation = 'verified_chat_id' not in channel_columns
         channel_fields = {
-            'editorial_brief': "TEXT NOT NULL DEFAULT 'Важные новости искусственного интеллекта: новые модели, продукты, исследования. Без рекламы, курсов и учебных статей.'",
+            'editorial_brief': "TEXT NOT NULL DEFAULT '"+DEFAULT_EDITORIAL_BRIEF+"'",
             'min_score': 'INTEGER NOT NULL DEFAULT 75',
             'interval_minutes': 'INTEGER NOT NULL DEFAULT 60',
             'daily_limit': 'INTEGER NOT NULL DEFAULT 6',
@@ -70,6 +70,12 @@ def init():
         for name, definition in post_fields.items():
             if name not in columns: con.execute(f'ALTER TABLE posts ADD COLUMN {name} {definition}')
         con.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, message TEXT NOT NULL, channel_id INTEGER, post_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+        # Correct only our old stock briefs. User-written editorial policies remain untouched.
+        for old_brief in LEGACY_BRIEFS:
+            ids=[r['id'] for r in con.execute('SELECT id FROM channels WHERE editorial_brief=?',(old_brief,))]
+            for cid in ids:
+                con.execute('UPDATE channels SET editorial_brief=? WHERE id=?',(DEFAULT_EDITORIAL_BRIEF,cid))
+                con.execute("UPDATE posts SET ai_status='pending',ai_score=NULL,ai_text_hash='',reviewed_at=NULL,ai_reason='Критерии редактора обновлены — нужна повторная оценка' WHERE channel_id=? AND status='draft'",(cid,))
         # Never inherit an old unchecked autopublish flag during upgrade.
         if new_automation: con.execute('UPDATE channels SET autopublish=0')
         con.execute("UPDATE channels SET autopublish=0,automation_error='Прерванная отправка. Сначала проверьте канал MAX.',next_publish_at=NULL WHERE id IN (SELECT channel_id FROM posts WHERE status='publishing')")
@@ -100,7 +106,7 @@ class ChannelIn(BaseModel):
     autopublish: bool = False
     keywords: str = ''
     exclude_keywords: str = ''
-    editorial_brief: str = 'Важные новости искусственного интеллекта: новые модели, продукты, исследования и их практическое применение. Без рекламы, курсов и учебных статей.'
+    editorial_brief: str = DEFAULT_EDITORIAL_BRIEF
     min_score: int = Field(default=75, ge=50, le=100)
     interval_minutes: int = Field(default=60, ge=15, le=1440)
     daily_limit: int = Field(default=6, ge=1, le=24)
@@ -159,6 +165,17 @@ def feed_image(entry):
         if checked: return checked
     return ''
 
+def feed_summary(entry):
+    blocks=[entry.get('summary','')]+[item.get('value','') for item in entry.get('content',[]) if isinstance(item,dict)]
+    cleaned=[]
+    for block in blocks:
+        value=re.sub(r'<(script|style)\b[^>]*>.*?</\1>', '', str(block or ''), flags=re.S|re.I)
+        value=html.unescape(re.sub('<[^>]+>',' ',value))
+        value=re.sub(r'\s+',' ',value).strip()
+        if value: cleaned.append(value)
+    return max(cleaned,key=len)[:6000] if cleaned else ''
+
+
 def canonical_url(url):
     parts=urlsplit(url)
     query=[(k,v) for k,v in parse_qsl(parts.query, keep_blank_values=True)
@@ -205,12 +222,15 @@ async def collect(channel_id, stats=None):
                         stats['found'] += 1
                     url = canonical_url(url)
                     fingerprint = hashlib.sha256((str(channel_id) + '|' + url).encode()).hexdigest()
+                    title = html.unescape(re.sub('<[^>]+>', '', entry.get('title', '')))[:250]
+                    summary = feed_summary(entry)
                     with db() as con:
-                        if con.execute('SELECT 1 FROM posts WHERE channel_id=? AND (fingerprint=? OR url=?)', (channel_id, fingerprint, url)).fetchone():
+                        existing=con.execute('SELECT id,status,source_summary FROM posts WHERE channel_id=? AND (fingerprint=? OR url=?)', (channel_id, fingerprint, url)).fetchone()
+                        if existing:
+                            if existing['status']=='draft' and summary and (not existing['source_summary'] or len(summary)>len(existing['source_summary'])+200):
+                                con.execute("UPDATE posts SET source_summary=?,ai_status='pending',ai_score=NULL,ai_text_hash='',reviewed_at=NULL,ai_reason='Получено более полное описание RSS — нужна повторная оценка' WHERE id=?",(summary,existing['id']))
                             if stats is not None: stats['duplicates'] += 1
                             continue
-                    title = html.unescape(re.sub('<[^>]+>', '', entry.get('title', '')))[:250]
-                    summary = html.unescape(re.sub('<[^>]+>', ' ', entry.get('summary', '') or ' '.join(x.get('value','') for x in entry.get('content', []))))[:6000]
                     if not interesting(title, summary, channel):
                         if stats is not None: stats['filtered'] += 1
                         continue
@@ -587,11 +607,16 @@ async def resolve_post(pid:int,item:ResolveIn):
     event('resolved','Результат отправки подтверждён пользователем',post_id=pid)
     return {'ok':True}
 
-async def review_pending(enabled_only=False):
+async def review_pending(enabled_only=False, include_rejected=False, channel_id=None):
     try:
         with db() as con:
-            query="SELECT p.id FROM posts p JOIN channels c ON c.id=p.channel_id WHERE p.status='draft' AND p.ai_status='pending'" + (' AND c.enabled=1' if enabled_only else '') + ' ORDER BY p.id LIMIT 30'
-            ids=[row['id'] for row in con.execute(query)]
+            query="SELECT p.id FROM posts p JOIN channels c ON c.id=p.channel_id WHERE p.status='draft' AND " + ("p.ai_status IN ('pending','rejected')" if include_rejected else "p.ai_status='pending'")
+            if enabled_only: query+=' AND c.enabled=1'
+            params=[]
+            if channel_id is not None:
+                query+=' AND p.channel_id=?'
+                params.append(channel_id)
+            ids=[row['id'] for row in con.execute(query+' ORDER BY p.id LIMIT 30',params)]
         REVIEW_STATE.update(total=len(ids),done=0,error=None)
         for pid in ids:
             try: await rewrite_post(pid)
@@ -603,12 +628,18 @@ async def review_pending(enabled_only=False):
     finally: REVIEW_STATE['running']=False
 
 
+class ReviewBatchIn(BaseModel):
+    include_rejected: bool = False
+    channel_id: Optional[int] = Field(default=None,ge=1)
+
+
 @app.post('/api/review',dependencies=[Depends(auth)])
-async def start_review():
+async def start_review(item: Optional[ReviewBatchIn] = None):
     global REVIEW_TASK
     if REVIEW_STATE['running'] or COLLECT_STATE['running']: raise HTTPException(409,'Дождитесь завершения сбора или оценки')
     REVIEW_STATE.update(running=True,done=0,total=0,error=None)
-    REVIEW_TASK=asyncio.create_task(review_pending())
+    options=item or ReviewBatchIn()
+    REVIEW_TASK=asyncio.create_task(review_pending(include_rejected=options.include_rejected,channel_id=options.channel_id))
     return {'started':True}
 
 
