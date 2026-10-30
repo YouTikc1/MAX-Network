@@ -2,11 +2,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ ! -d .venv ]; then
-  if ! command -v python3.12 >/dev/null 2>&1; then
-    echo 'Установите Python 3.12: brew install python@3.12 (или с python.org).'
+  python_bin=''
+  for candidate in python3.12 /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 python3.13 python3.14 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; assert sys.version_info >= (3,12)' >/dev/null 2>&1; then
+      python_bin="$candidate"
+      break
+    fi
+  done
+  if [ -z "$python_bin" ]; then
+    echo 'Установите Python 3.12+ с python.org (macOS universal2 installer).'
     exit 1
   fi
-  python3.12 -m venv .venv
+  "$python_bin" -m venv .venv
 fi
 .venv/bin/python -c 'import sys; assert sys.version_info >= (3,12), "Нужен Python 3.12+. Переименуйте старую .venv и повторите запуск."'
 .venv/bin/python -m pip install -r requirements.lock.txt
