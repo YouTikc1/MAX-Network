@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS
+from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS, NEWS_REVISION, clean_post
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -25,6 +25,9 @@ PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 COLLECT_STATE = {'running': False, 'phase': 'Ожидание', 'found': 0, 'duplicates': 0, 'added': 0, 'errors': [], 'finished': None}
 COLLECT_LOCK = asyncio.Lock()
 COLLECT_TASK = None
+BACKGROUND_ENABLED=os.getenv('NETWORK_BACKGROUND','1')!='0'
+ONE_TASKS={}
+ONE_JOBS={}
 REVIEW_TASK = None
 REVIEW_STATE = {"running":False,"done":0,"total":0,"error":None}
 COLLECT_STATE.update(filtered=0, sources_done=0, sources_total=0)
@@ -65,11 +68,14 @@ def init():
             'ai_reason': "TEXT NOT NULL DEFAULT 'Ещё не проверено редактором'",
             'ai_text_hash': "TEXT NOT NULL DEFAULT ''", 'source_summary': "TEXT NOT NULL DEFAULT ''",
             'source_published_at': 'TEXT', 'reviewed_at': 'TEXT', 'published_chat_id': 'TEXT',
-            'publish_mode': 'TEXT',
+            'publish_mode': 'TEXT', 'editorial_revision':'INTEGER NOT NULL DEFAULT 0',
+            'news_event':"TEXT NOT NULL DEFAULT ''", 'news_evidence':"TEXT NOT NULL DEFAULT ''",
+            'user_edited':'INTEGER NOT NULL DEFAULT 0',
         }
         for name, definition in post_fields.items():
             if name not in columns: con.execute(f'ALTER TABLE posts ADD COLUMN {name} {definition}')
         con.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, message TEXT NOT NULL, channel_id INTEGER, post_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+        con.execute("UPDATE posts SET ai_status='pending',ai_score=NULL,ai_text_hash='',ai_reason='Обновлена проверка новостей — редактор проверит автоматически' WHERE status='draft' AND editorial_revision<?",(NEWS_REVISION,))
         # Correct only our old stock briefs. User-written editorial policies remain untouched.
         for old_brief in LEGACY_BRIEFS:
             ids=[r['id'] for r in con.execute('SELECT id FROM channels WHERE editorial_brief=?',(old_brief,))]
@@ -129,7 +135,7 @@ def ai_result(verdict, url, min_score):
     if verdict.publishable and verdict.score<min_score:
         verdict.reason=f'Оценка {verdict.score} ниже порога {min_score}. '+verdict.reason
     text=verdict.text.strip() if verdict.publishable else ''
-    if text and url: text+='\n\nИсточник: '+url
+    text=clean_post(text)
     return ('approved' if approved else 'rejected', text, verdict.reason, verdict.score)
 
 def safe_image_url(url):
@@ -196,9 +202,16 @@ def validate_channel(item):
     except Exception: raise HTTPException(400,'Неизвестный часовой пояс')
     if not item.editorial_brief.strip() or len(item.editorial_brief)>2000: raise HTTPException(400,'Задайте тематику канала: 1–2000 символов')
 
-async def collect(channel_id, stats=None):
+def ensure_news_source(cid):
     with db() as con:
-        sources = con.execute('SELECT url FROM sources WHERE channel_id=?', (channel_id,)).fetchall()
+        ch=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
+        if ch and ch['editorial_brief']==DEFAULT_EDITORIAL_BRIEF and (cid==1 or ch['chat_id']):
+            con.execute('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',(cid,'https://habr.com/ru/rss/news/?fl=ru'))
+
+
+async def collect(channel_id, stats=None, stop_after_ready=False):
+    with db() as con:
+        sources = con.execute("SELECT url FROM sources WHERE channel_id=? ORDER BY CASE WHEN url LIKE '%/rss/news/%' THEN 0 ELSE 1 END,id", (channel_id,)).fetchall()
         channel = con.execute('SELECT * FROM channels WHERE id=?', (channel_id,)).fetchone()
     added = 0
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
@@ -224,9 +237,13 @@ async def collect(channel_id, stats=None):
                     fingerprint = hashlib.sha256((str(channel_id) + '|' + url).encode()).hexdigest()
                     title = html.unescape(re.sub('<[^>]+>', '', entry.get('title', '')))[:250]
                     summary = feed_summary(entry)
+                    published=entry.get('published_parsed') or entry.get('updated_parsed')
+                    published_at=datetime.fromtimestamp(calendar.timegm(published),timezone.utc).isoformat() if published else None
                     with db() as con:
                         existing=con.execute('SELECT id,status,source_summary FROM posts WHERE channel_id=? AND (fingerprint=? OR url=?)', (channel_id, fingerprint, url)).fetchone()
                         if existing:
+                            if published_at:
+                                con.execute('UPDATE posts SET source_published_at=COALESCE(source_published_at,?) WHERE id=?',(published_at,existing['id']))
                             if existing['status']=='draft' and summary and (not existing['source_summary'] or len(summary)>len(existing['source_summary'])+200):
                                 con.execute("UPDATE posts SET source_summary=?,ai_status='pending',ai_score=NULL,ai_text_hash='',reviewed_at=NULL,ai_reason='Получено более полное описание RSS — нужна повторная оценка' WHERE id=?",(summary,existing['id']))
                             if stats is not None: stats['duplicates'] += 1
@@ -238,6 +255,7 @@ async def collect(channel_id, stats=None):
                         stats['phase'] = 'Ollama: ' + title[:80]
                     published=entry.get('published_parsed') or entry.get('updated_parsed')
                     published_at=datetime.fromtimestamp(calendar.timegm(published),timezone.utc).isoformat() if published else None
+                    verdict=None
                     if published_at and utcnow()-datetime.fromisoformat(published_at)>timedelta(hours=72):
                         ai_status,content,reason,score='rejected',title+'\n\n'+summary[:900], 'Старше 72 часов',0
                     else:
@@ -247,18 +265,20 @@ async def collect(channel_id, stats=None):
                         except EditorialUnavailable as exc:
                             ai_status,content,reason,score='pending',title+'\n\n'+summary[:900],str(exc),None
                             if stats is not None: stats['errors'].append(title[:60]+': '+str(exc))
-                    if not content: content=title+'\n\n'+summary[:900]+('\n\nИсточник: '+url)
+                    if not content: content=title+'\n\n'+summary[:900]
                     with db() as con:
                         latest=con.execute('SELECT * FROM channels WHERE id=?',(channel_id,)).fetchone()
                         if any(latest[k]!=channel[k] for k in ('editorial_brief','keywords','exclude_keywords','min_score')):
                             ai_status,reason='pending','Настройки редактора изменились во время сбора — нужна повторная оценка'
-                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,ai_status,ai_score,ai_reason,ai_text_hash,source_summary,source_published_at,reviewed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (channel_id,title,content,url,fingerprint,feed_image(entry),ai_status,score,reason,text_hash(content) if ai_status=='approved' else '',summary,published_at,utcnow().isoformat()))
+                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,ai_status,ai_score,ai_reason,ai_text_hash,source_summary,source_published_at,reviewed_at,editorial_revision,news_event,news_evidence) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (channel_id,title,content,url,fingerprint,feed_image(entry),ai_status,score,reason,text_hash(content) if ai_status=='approved' else '',summary,published_at,utcnow().isoformat(),NEWS_REVISION,verdict.event if verdict else '',verdict.evidence if verdict else ''))
                         added+=cur.rowcount
                         if stats is not None:
                             stats['added']+=cur.rowcount
                             if ai_status=='rejected': stats['filtered']+=cur.rowcount
                     if cur.rowcount: event(ai_status,reason,channel_id,cur.lastrowid)
+                    if stop_after_ready and ai_status=='approved' and published_at and timedelta(0)<=utcnow()-datetime.fromisoformat(published_at)<timedelta(hours=48):
+                        return added
             except Exception as exc:
                 error = feed_url + ': ' + str(exc)[:180]
                 print('Feed error:', error, flush=True)
@@ -288,14 +308,17 @@ def automation_ready(channel, now):
 
 
 def auto_candidate(row,channel,now):
+    if row['editorial_revision']!=NEWS_REVISION or not row['news_event'] or not row['news_evidence']: return False
+    if not row['source_published_at']: return False
+    if datetime.fromisoformat(row['source_published_at'])>now+timedelta(minutes=15): return False
     if row['ai_status']!='approved' or row['ai_score'] is None or row['ai_score']<channel['min_score']: return False
     if not interesting(row['title'] or '',row['source_summary'] or row['text'],channel): return False
     if row['ai_text_hash']!=text_hash(row['text']) or not row['reviewed_at'] or row['error']: return False
-    if not validate_copy(row['text'].split('\n\nИсточник:')[0]): return False
+    if not validate_copy(clean_post(row['text'])): return False
     if now-datetime.fromisoformat(row['reviewed_at'])>timedelta(hours=24): return False
     created=datetime.fromisoformat(row['created_at'].replace(' ','T')).replace(tzinfo=timezone.utc)
-    if now-created>timedelta(hours=72): return False
-    if row['source_published_at'] and now-datetime.fromisoformat(row['source_published_at'])>timedelta(hours=72): return False
+    if now-created>timedelta(hours=48): return False
+    if row['source_published_at'] and now-datetime.fromisoformat(row['source_published_at'])>timedelta(hours=48): return False
     with db() as con:
         previous=con.execute("SELECT title,url FROM posts WHERE channel_id=? AND status IN ('published','uncertain')",(channel['id'],)).fetchall()
     title=re.sub(r'\W+',' ',row['title'] or '').strip().casefold()
@@ -320,14 +343,16 @@ async def _publish(post_id, automatic=False):
         channel=con.execute('SELECT * FROM channels WHERE id=?',(row['channel_id'],)).fetchone()
     if row['status']!='draft': raise ValueError('Пост уже отправлен или требует сверки с MAX')
     if not TOKEN or not channel['chat_id']: raise ValueError('Не настроены MAX_TOKEN или Chat ID')
-    if not channel['enabled']: raise ValueError('Канал отключён')
+    if automatic and not channel['enabled']: raise ValueError('Автопостинг канала отключён')
     if row['text'].startswith('⚠️ Требуется обработка ИИ'): raise ValueError('Сначала обработайте черновик через Ollama')
     if automatic and (not automation_ready(channel,now) or not auto_candidate(row,channel,now)):
         raise ValueError('Пост или расписание не прошли проверку автопубликации')
-    if not automatic and row['image_url'] and not row['image_approved']:
-        raise ValueError('Подтвердите права на изображение либо уберите его URL')
-    payload={'text':row['text'][:4000]}
-    if row['image_url'] and row['image_approved']:
+    if not validate_copy(clean_post(row['text'])):
+        raise ValueError('Текст содержит инструкции, пересказ статьи или некорректный формат. Редактор подготовит новую версию.')
+    if row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or row['ai_text_hash']!=text_hash(row['text']) or not row['news_event'] or not row['news_evidence']:
+        raise ValueError('Редактор ещё проверяет новость. Непроверенный текст отправлен не будет.')
+    payload={'text':clean_post(row['text'])}
+    if row['image_url']:
         payload['attachments']=[{'type':'image','payload':{'url':row['image_url']}}]
     with db() as con:
         # Durable claim prevents retries after a restart or another worker.
@@ -366,14 +391,14 @@ async def automation_tick():
         now=utcnow()
         if not automation_ready(channel,now): continue
         with db() as con:
-            candidates=con.execute("SELECT * FROM posts WHERE channel_id=? AND status='draft' AND ai_status='approved' ORDER BY ai_score DESC,id",(channel['id'],)).fetchall()
+            candidates=con.execute("SELECT * FROM posts WHERE channel_id=? AND status='draft' AND ai_status='approved' ORDER BY source_published_at DESC,ai_score DESC,id DESC",(channel['id'],)).fetchall()
         for post in candidates:
             if not auto_candidate(post,channel,now): continue
             try: await publish(post['id'],automatic=True)
             except Exception: pass  # Durable error + pause are recorded by publish().
             break
 
-async def run_collection(enabled_only=False):
+async def run_collection(enabled_only=False, channel_id=None, stop_after_ready=False):
     async with COLLECT_LOCK:
         COLLECT_STATE.update(running=True, phase='Начинаем сбор', found=0, duplicates=0,
                              added=0, filtered=0, sources_done=0, sources_total=0, errors=[], finished=None)
@@ -381,9 +406,11 @@ async def run_collection(enabled_only=False):
             with db() as con:
                 query = 'SELECT id FROM channels' + (' WHERE enabled=1' if enabled_only else '')
                 ids = [row['id'] for row in con.execute(query)]
+                if channel_id is not None: ids=[cid for cid in ids if cid==channel_id]
+                for cid in ids: ensure_news_source(cid)
                 COLLECT_STATE['sources_total'] = sum(con.execute('SELECT COUNT(*) FROM sources WHERE channel_id=?', (cid,)).fetchone()[0] for cid in ids)
             for cid in ids:
-                await collect(cid, COLLECT_STATE)
+                await collect(cid, COLLECT_STATE, stop_after_ready=stop_after_ready)
         except Exception as exc:
             COLLECT_STATE['errors'].append(type(exc).__name__ + ': ошибка сбора')
         finally:
@@ -392,10 +419,10 @@ async def run_collection(enabled_only=False):
 async def tick():
     if not COLLECT_LOCK.locked() and not COLLECT_STATE['running'] and not REVIEW_STATE['running']:
         COLLECT_STATE['running'] = True
-        await run_collection(enabled_only=True)
+        await run_collection()
         if not REVIEW_STATE['running']:
             REVIEW_STATE['running']=True
-            await review_pending(enabled_only=True)
+            await review_pending()
 
 @asynccontextmanager
 async def lifespan(app):
@@ -404,11 +431,13 @@ async def lifespan(app):
     scheduler.add_job(tick,'interval',minutes=30,max_instances=1,coalesce=True)
     scheduler.add_job(automation_tick,'interval',minutes=1,max_instances=1,coalesce=True)
     scheduler.start()
+    global COLLECT_TASK
+    if BACKGROUND_ENABLED: COLLECT_TASK=asyncio.create_task(tick())
     try:
         yield
     finally:
         scheduler.shutdown(wait=False)
-        for task in (COLLECT_TASK, REVIEW_TASK):
+        for task in (COLLECT_TASK, REVIEW_TASK, *ONE_TASKS.values()):
             if task and not task.done():
                 task.cancel()
                 try: await task
@@ -475,13 +504,17 @@ async def delete_channel(cid:int):
 def sources():
     with db() as con: return [dict(x) for x in con.execute('SELECT * FROM sources')]
 @app.post('/api/sources',dependencies=[Depends(auth)])
-def add_source(item:SourceIn):
+async def add_source(item:SourceIn):
     url = item.url.strip()
     if not safe_image_url(url): raise HTTPException(400,'Укажите публичный HTTPS URL источника')
     with db() as con:
         if not con.execute('SELECT 1 FROM channels WHERE id=?',(item.channel_id,)).fetchone(): raise HTTPException(404,'Канал не найден')
         cur=con.execute('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',(item.channel_id,url))
         if not cur.rowcount: raise HTTPException(409,'Источник уже добавлен')
+    global COLLECT_TASK
+    if BACKGROUND_ENABLED and not COLLECT_STATE['running']:
+        COLLECT_STATE['running']=True
+        COLLECT_TASK=asyncio.create_task(manual_pipeline())
     return {'ok':True}
 @app.delete('/api/sources/{sid}',dependencies=[Depends(auth)])
 def remove_source(sid:int):
@@ -500,12 +533,12 @@ async def collect_now():
     if COLLECT_STATE['running'] or COLLECT_LOCK.locked() or REVIEW_STATE['running']:
         raise HTTPException(409, 'Сбор уже выполняется')
     COLLECT_STATE.update(running=True, phase='Начинаем сбор', errors=[], finished=None)
-    COLLECT_TASK = asyncio.create_task(run_collection())
+    COLLECT_TASK = asyncio.create_task(manual_pipeline())
     return {'started':True}
 @app.put('/api/posts/{pid}',dependencies=[Depends(auth)])
 async def edit_post(pid:int,item:dict):
     if PUBLISH_LOCK.locked(): raise HTTPException(409,'Дождитесь завершения публикации')
-    value=str(item.get('text','')).strip()
+    value=clean_post(item.get('text',''))
     if not value or len(value)>4000: raise HTTPException(400,'Text must be 1-4000 characters')
     image_url=str(item.get('image_url','')).strip()
     if image_url and not safe_image_url(image_url): raise HTTPException(400,'Image must be a public HTTPS URL')
@@ -514,13 +547,21 @@ async def edit_post(pid:int,item:dict):
         row=con.execute("SELECT * FROM posts WHERE id=? AND status='draft'",(pid,)).fetchone()
         if not row: raise HTTPException(400,'Редактировать можно только черновики')
         changed=value!=row['text']
-        con.execute("UPDATE posts SET text=?,image_url=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,error=NULL WHERE id=?",
+        con.execute("UPDATE posts SET text=?,image_url=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,user_edited=?,error=NULL WHERE id=?",
             (value,image_url,approved,'pending' if changed else row['ai_status'],'' if changed else row['ai_text_hash'],
-             'Текст изменён — нужна оценка ИИ' if changed else row['ai_reason'],pid))
+             'Текст проверяется редактором автоматически' if changed else row['ai_reason'],int(changed or row['user_edited']),pid))
+    if changed: queue_review()
     return {'ok':True}
 @app.post('/api/posts/{pid}/publish',dependencies=[Depends(auth)])
 async def publish_now(pid:int):
-    try: return await publish(pid)
+    try:
+        if REVIEW_TASK and not REVIEW_TASK.done(): await asyncio.shield(REVIEW_TASK)
+        with db() as con: row=con.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+        if not row: raise HTTPException(404,'Пост не найден')
+        if row['status']=='draft' and (row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or not validate_copy(clean_post(row['text']))):
+            await rewrite_post(pid)
+        return await publish(pid)
+    except HTTPException: raise
     except ValueError as exc: raise HTTPException(400,str(exc))
     except Exception: raise HTTPException(502,'Ошибка MAX API. Проверьте доступ, токен и права бота; перед повтором проверьте канал.')
 
@@ -556,17 +597,17 @@ async def rewrite_post(pid:int):
         if not interesting(row['title'] or '',context,channel):
             verdict=Verdict(publishable=False,score=0,reason='Не соответствует ключевым словам или исключающим фильтрам канала',text='')
         else:
-            verdict=await review(row['title'],context,channel['editorial_brief'])
+            verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None)
     except EditorialUnavailable as exc: raise HTTPException(503,str(exc))
     state,text,reason,score=ai_result(verdict,row['url'],channel['min_score'])
-    if not text: text=row['text']
+    if not text: text=clean_post(row['text'])
     async with PUBLISH_LOCK:
         with db() as con:
             latest=con.execute('SELECT editorial_brief,min_score,keywords,exclude_keywords FROM channels WHERE id=?',(channel['id'],)).fetchone()
             if any(latest[k]!=channel[k] for k in ('editorial_brief','min_score','keywords','exclude_keywords')):
                 raise HTTPException(409,'Настройки канала изменены во время оценки. Повторите.')
-            cur=con.execute("UPDATE posts SET text=?,ai_status=?,ai_reason=?,ai_score=?,ai_text_hash=?,reviewed_at=?,error=NULL WHERE id=? AND status='draft' AND text=?",
-                (text,state,reason,score,text_hash(text) if state=='approved' else '',utcnow().isoformat(),pid,row['text']))
+            cur=con.execute("UPDATE posts SET text=?,ai_status=?,ai_reason=?,ai_score=?,ai_text_hash=?,reviewed_at=?,editorial_revision=?,news_event=?,news_evidence=?,user_edited=0,error=NULL WHERE id=? AND status='draft' AND text=?",
+                (text,state,reason,score,text_hash(text) if state=='approved' else '',utcnow().isoformat(),NEWS_REVISION,verdict.event,verdict.evidence,pid,row['text']))
             if not cur.rowcount: raise HTTPException(409,'Черновик изменён во время оценки. Повторите.')
     event(state,reason,channel['id'],pid)
     return {'ok':True,'ai_status':state,'reason':reason}
@@ -616,7 +657,7 @@ async def review_pending(enabled_only=False, include_rejected=False, channel_id=
             if channel_id is not None:
                 query+=' AND p.channel_id=?'
                 params.append(channel_id)
-            ids=[row['id'] for row in con.execute(query+' ORDER BY p.id LIMIT 30',params)]
+            ids=[row['id'] for row in con.execute(query+' ORDER BY p.user_edited DESC,p.source_published_at DESC,p.id DESC LIMIT 30',params)]
         REVIEW_STATE.update(total=len(ids),done=0,error=None)
         for pid in ids:
             try: await rewrite_post(pid)
@@ -646,3 +687,66 @@ async def start_review(item: Optional[ReviewBatchIn] = None):
 @app.get('/api/review/status',dependencies=[Depends(auth)])
 def review_status():
     return dict(REVIEW_STATE)
+
+
+def queue_review():
+    global REVIEW_TASK
+    if not REVIEW_STATE['running']:
+        REVIEW_STATE.update(running=True,error=None)
+        REVIEW_TASK=asyncio.create_task(review_pending())
+
+
+async def manual_pipeline():
+    await run_collection()
+    if not REVIEW_STATE['running']:
+        REVIEW_STATE['running']=True
+        await review_pending()
+
+
+def best_post(cid):
+    now=utcnow()
+    with db() as con:
+        channel=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
+        posts=con.execute("SELECT * FROM posts WHERE channel_id=? AND status='draft' AND ai_status='approved' ORDER BY source_published_at DESC,ai_score DESC,id DESC",(cid,)).fetchall()
+    return next((p for p in posts if auto_candidate(p,channel,now)),None)
+
+
+async def publish_one_job(cid):
+    job=ONE_JOBS[cid]
+    try:
+        candidate=best_post(cid)
+        if not candidate:
+            job['phase']='Ищем свежую новость и проверяем факты по RSS…'
+            await run_collection(channel_id=cid,stop_after_ready=True)
+            candidate=best_post(cid)
+            if not candidate:
+                await review_pending(channel_id=cid)
+                candidate=best_post(cid)
+        if not candidate:
+            raise ValueError('Подходящей свежей новости об ИИ нет. Статьи, инструкции и непроверенные тексты не публикуем.')
+        job['phase']='Отправляем новость в MAX…'
+        await publish(candidate['id'])
+        job.update(post_id=candidate['id'],phase='Новость опубликована')
+    except Exception as exc:
+        job.update(error=str(exc) if isinstance(exc,(ValueError,HTTPException)) else 'Ошибка отправки. Проверьте журнал и канал MAX.',phase='Отправка не выполнена')
+    finally:
+        job.update(running=False,finished=utcnow().isoformat())
+
+
+@app.post('/api/channels/{cid}/publish-one',dependencies=[Depends(auth)],status_code=202)
+async def publish_one(cid:int):
+    with db() as con: channel=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
+    if not channel: raise HTTPException(404,'Канал не найден')
+    if not TOKEN or not channel['chat_id']: raise HTTPException(400,'Один раз укажите Chat ID канала в настройках и проверьте MAX_TOKEN')
+    if ONE_JOBS.get(cid,{}).get('running'): raise HTTPException(409,'Уже готовим одну новость для этого канала')
+    with db() as con:
+        if con.execute("SELECT 1 FROM posts WHERE channel_id=? AND status='uncertain'",(cid,)).fetchone():
+            raise HTTPException(409,'Сначала сверьте результат предыдущей отправки с MAX, чтобы не создать дубль')
+    ONE_JOBS[cid]={'running':True,'phase':'Выбираем самую свежую подходящую новость…','error':None,'post_id':None,'finished':None}
+    ONE_TASKS[cid]=asyncio.create_task(publish_one_job(cid))
+    return {'started':True}
+
+
+@app.get('/api/publish-jobs',dependencies=[Depends(auth)])
+def publish_jobs():
+    return {str(cid):dict(job) for cid,job in ONE_JOBS.items()}
