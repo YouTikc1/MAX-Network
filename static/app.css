@@ -7,3 +7,5 @@
 .ai-reason{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.editor-verdict p{overflow-wrap:anywhere}
 
 .channel-card-foot{flex-wrap:wrap}.channel-actions{display:flex;gap:8px;flex-wrap:wrap}.one-job-status{font-size:12px;line-height:1.8;color:#8673ad}.autosave-status{font-size:11px;color:#9784b7;align-self:center}.channel-card-foot>span{font-size:11px}
+
+.reserve-banner{display:flex;gap:14px;align-items:center;background:#f0ebff;border:1px solid #e3d9ff;border-radius:12px;padding:18px 21px;margin-bottom:22px;color:#8263c4}.reserve-banner.filled{background:#ecf8f1;border-color:#d6edde;color:#448d70}.reserve-symbol{font-size:25px}.reserve-banner strong{font-size:14px}.reserve-banner p{font-size:12px;line-height:1.8;margin:7px 0 0}.reserve-banner small{font-size:11px}.channel-reserve{font-size:12px;color:#9584b3;background:#f8f5ff;border-radius:8px;padding:12px;margin-bottom:16px}.channel-reserve strong{color:#7653be}.reserve-banner p b{font-variant-numeric:tabular-nums}

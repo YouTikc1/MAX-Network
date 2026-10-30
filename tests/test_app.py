@@ -60,7 +60,7 @@ def network(monkeypatch,*,approve=True,score=91,copy=COPY,evidence=None,news=Tru
             if failure=='ollama': raise httpx.ConnectError('offline',request=request)
             if stage=='NewsDecision':
                 body=json.loads(payload['prompt'])['article']['body']
-                result={'publishable':approve,'is_news':news,'score':score,'reason':'Свежий релиз модели' if approve else 'Это инструкция, а не новость','event':'Компания выпустила новую модель ИИ' if approve else '', 'evidence':(body[:60] if evidence is None else evidence) if approve else ''}
+                result={'publishable':approve,'is_news':news,'score':score,'reason':'Свежий релиз модели' if approve else 'Это инструкция, а не новость','event':json.loads(payload['prompt'])['article']['title'] if approve else '', 'is_ai':True, 'support_ids':([0,1] if evidence is None else [999]) if approve else []}
             elif stage=='CopyCheck': result={'valid':copy_valid,'reason':'Факты подтверждены материалом' if copy_valid else 'В тексте есть неподтверждённые характеристики'}
             else: result={'text':copy}
             return httpx.Response(200,json={'response':json.dumps(result,ensure_ascii=False)})
@@ -141,10 +141,10 @@ def test_non_news_not_written(client,monkeypatch,news,approve):
     assert len(calls)==1
 
 
-def test_unverified_evidence_blocks_writer(client,monkeypatch):
+def test_invalid_fragment_ids_are_retried_without_writer(client,monkeypatch):
     calls=network(monkeypatch,evidence='Компания объявила совершенно несуществующее событие')
     with pytest.raises(editorial.EditorialUnavailable):asyncio.run(editorial.review('Модель',SOURCE,'ИИ'))
-    assert len(calls)==1
+    assert len(calls)==2
 
 
 def test_unavailable_model_no_publication(client,monkeypatch):
@@ -322,7 +322,7 @@ def test_source_date_backfill_and_news_feed_preserve_data(client,monkeypatch):
     assert saved['id']==pid and saved['text']==COPY and saved['source_published_at']
     BOOTSTRAP(1);BOOTSTRAP(1)
     sources=client.get('/api/sources').json()
-    assert len(sources)==2 and any('/rss/news/' in r['url'] for r in sources)
+    assert len(sources)==1+len(module.NEWS_FEEDS) and any('/rss/news/' in r['url'] for r in sources)
 
 
 def test_scope_recheck_respects_channel(client,monkeypatch):
@@ -380,3 +380,105 @@ def test_unsupported_copy_claims_are_not_published(client,monkeypatch):
     calls=network(monkeypatch,copy_valid=False)
     assert client.post(f'/api/posts/{pid}/publish').status_code==503
     assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+
+@pytest.mark.parametrize('title,body',[
+    ('Microsoft прекращает поддержку Copilot на смарт-телевизорах LG','Microsoft сообщила о прекращении сервиса Copilot в 2026 году.'),
+    ('Xiaomi выпустила открытую модель OCR-0 для распознавания документов','Модель распознаёт текст и извлекает поля документов.'),
+    ('Apple приобрела ИИ-стартап Ascend.io','Компания заключила сделку по покупке разработчика ИИ-платформы.'),
+    ('Anthropic переименовала подписки и сняла лимиты','Разработчик Claude обновил тарифы модели.'),
+    ('Сэм Альтман высказался о локальном инференсе','Руководитель OpenAI сделал заявление об обработке данных.'),
+])
+def test_examples_from_user_are_ai_relevant(client,title,body):
+    assert editorial.is_ai_story(title,body)
+
+
+def test_nodpi_cannot_get_model_approval_or_be_sent(client,monkeypatch):
+    title='Выпуск NoDPI4Android 2.0 — открытого инструмента для модификации трафика'
+    body='Приложение переписано с нуля на Kotlin, Jetpack Compose и Material 3. Работает прокси-сервер.'
+    calls=network(monkeypatch)
+    result=asyncio.run(editorial.review(title,body,'Новости ИИ'))
+    assert not result.publishable and result.score==0 and not calls
+    configure(client,monkeypatch)
+    pid=post(title=title,source_summary=body,ai_score=95)
+    assert client.post(f'/api/posts/{pid}/publish').status_code==400
+    assert not calls
+
+
+def test_paraphrased_event_uses_supplied_fragments_not_exact_echo(client,monkeypatch):
+    network(monkeypatch)
+    result=asyncio.run(editorial.review('Apple купила ИИ-стартап',SOURCE,'ИИ'))
+    assert result.publishable and result.evidence
+    assert result.evidence in 'Apple купила ИИ-стартап '+SOURCE
+
+
+def pool_feed(total=25):
+    now=datetime.now(timezone.utc)
+    items=[]
+    for i in range(total):
+        items.append(f'<item><title>Компания Product{i} выпустила модель ИИ версии {i}</title><link>https://news.example/product{i}</link><pubDate>{format_datetime(now-timedelta(minutes=i))}</pubDate><description>{SOURCE}</description></item>')
+    return '<rss version="2.0"><channel><title>AI news</title>'+''.join(items)+'</channel></rss>'
+
+
+def test_reserve_prepares_ten_plus_two_spares_from_more_than_ten_candidates(client,monkeypatch):
+    network(monkeypatch,rss=pool_feed())
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    ready=module.ready_posts(1)
+    assert len(ready)==10
+    assert len(module.prepared_posts(1))==12
+    with module.db() as con:
+        assert con.execute('SELECT COUNT(*) FROM posts').fetchone()[0]==25
+        assert con.execute("SELECT COUNT(*) FROM posts WHERE ai_status='standby'").fetchone()[0]==2
+    status=client.get('/api/queue/status').json()['channels'][0]
+    assert status['ready']==10 and status['missing']==0
+    assert client.get('/api/overview').json()['approved']==10
+    assert len([p for p in client.get('/api/posts').json() if p['queue_ready']])==10
+
+
+def test_consumed_post_is_immediately_replaced_by_spare(client,monkeypatch):
+    configure(client,monkeypatch)
+    network(monkeypatch,rss=pool_feed())
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    first=module.best_post(1)
+    asyncio.run(module.publish(first['id']))
+    assert len(module.ready_posts(1))==10
+    assert len(module.prepared_posts(1))==11
+    asyncio.run(module.run_collection())
+    assert len(module.prepared_posts(1))==12
+    assert len(module.ready_posts(1))==10
+
+
+def test_reserve_does_not_fill_with_irrelevant_or_low_quality_material(client,monkeypatch):
+    feed=pool_feed(3)
+    extra=''.join(f'<item><title>NoDPI Android app {i}</title><link>https://news.example/not-ai-{i}</link><pubDate>{format_datetime(datetime.now(timezone.utc))}</pubDate><description>Kotlin Jetpack Compose Material 3 proxy server</description></item>' for i in range(15))
+    feed=feed.replace('</channel>',extra+'</channel>')
+    calls=network(monkeypatch,rss=feed)
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    assert len(module.ready_posts(1))==3
+    status=client.get('/api/queue/status').json()['channels'][0]
+    assert status['missing']==7
+    assert len([r for r in calls if r.url.path=='/api/generate'])==9
+
+
+def test_one_bad_generation_does_not_stop_next_good_news(client,monkeypatch):
+    bad=post(title='OpenAI выпустила Product0',fingerprint='bad',ai_status='pending')
+    good=post(title='Google выпустила Gemini Product1',fingerprint='good',ai_status='pending',source_published_at=(datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat())
+    network(monkeypatch)
+    original=module.review
+    async def review(title,*args,**kw):
+        if 'Product0' in title: raise editorial.EditorialUnavailable('Проблема текста одной новости','quality')
+        return await original(title,*args,**kw)
+    monkeypatch.setattr(module,'review',review)
+    asyncio.run(module.review_pending())
+    posts={p['id']:p for p in client.get('/api/posts').json()}
+    assert posts[bad]['review_after'] and posts[bad]['review_attempts']==1
+    assert posts[good]['ai_status']=='approved'
+
+
+def test_expired_news_leaves_ready_reserve(client,monkeypatch):
+    post(source_published_at=(datetime.now(timezone.utc)-timedelta(hours=49)).isoformat())
+    module.refresh_reserve()
+    assert module.ready_posts(1)==[]
+    assert client.get('/api/posts').json()[0]['ai_status']=='expired'

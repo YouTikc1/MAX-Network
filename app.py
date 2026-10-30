@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS, NEWS_REVISION, clean_post
+from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS, NEWS_REVISION, clean_post, is_ai_story
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -26,6 +26,9 @@ COLLECT_STATE = {'running': False, 'phase': 'Ожидание', 'found': 0, 'dup
 COLLECT_LOCK = asyncio.Lock()
 COLLECT_TASK = None
 BACKGROUND_ENABLED=os.getenv('NETWORK_BACKGROUND','1')!='0'
+LAST_REFILL_AT=None
+QUEUE_TARGET=10
+NEWS_FEEDS=('https://habr.com/ru/rss/news/?fl=ru','https://www.ixbt.com/export/news.rss','https://3dnews.ru/news/rss')
 ONE_TASKS={}
 ONE_JOBS={}
 REVIEW_TASK = None
@@ -71,11 +74,15 @@ def init():
             'publish_mode': 'TEXT', 'editorial_revision':'INTEGER NOT NULL DEFAULT 0',
             'news_event':"TEXT NOT NULL DEFAULT ''", 'news_evidence':"TEXT NOT NULL DEFAULT ''",
             'user_edited':'INTEGER NOT NULL DEFAULT 0',
+            'review_attempts':'INTEGER NOT NULL DEFAULT 0', 'review_after':'TEXT', 'review_kind':'TEXT',
         }
         for name, definition in post_fields.items():
             if name not in columns: con.execute(f'ALTER TABLE posts ADD COLUMN {name} {definition}')
         con.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, message TEXT NOT NULL, channel_id INTEGER, post_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
         con.execute("UPDATE posts SET ai_status='pending',ai_score=NULL,ai_text_hash='',ai_reason='Обновлена проверка новостей — редактор проверит автоматически' WHERE status='draft' AND editorial_revision<?",(NEWS_REVISION,))
+        source_columns={r[1] for r in con.execute('PRAGMA table_info(sources)')}
+        for name in ('last_checked_at','last_error'):
+            if name not in source_columns: con.execute(f'ALTER TABLE sources ADD COLUMN {name} TEXT')
         # Correct only our old stock briefs. User-written editorial policies remain untouched.
         for old_brief in LEGACY_BRIEFS:
             ids=[r['id'] for r in con.execute('SELECT id FROM channels WHERE editorial_brief=?',(old_brief,))]
@@ -206,85 +213,61 @@ def ensure_news_source(cid):
     with db() as con:
         ch=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
         if ch and ch['editorial_brief']==DEFAULT_EDITORIAL_BRIEF and (cid==1 or ch['chat_id']):
-            con.execute('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',(cid,'https://habr.com/ru/rss/news/?fl=ru'))
+            con.executemany('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',[(cid,url) for url in NEWS_FEEDS])
 
 
 async def collect(channel_id, stats=None, stop_after_ready=False):
     with db() as con:
-        sources = con.execute("SELECT url FROM sources WHERE channel_id=? ORDER BY CASE WHEN url LIKE '%/rss/news/%' THEN 0 ELSE 1 END,id", (channel_id,)).fetchall()
-        channel = con.execute('SELECT * FROM channels WHERE id=?', (channel_id,)).fetchone()
-    added = 0
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        sources=con.execute('SELECT * FROM sources WHERE channel_id=? ORDER BY id',(channel_id,)).fetchall()
+        channel=con.execute('SELECT * FROM channels WHERE id=?',(channel_id,)).fetchone()
+    added=0
+    async with httpx.AsyncClient(timeout=25,follow_redirects=True) as client:
         for source in sources:
-            feed_url = source['url']
-            if stats is not None:
-                stats['phase'] = 'Читаем RSS: ' + feed_url[:90]
+            url=source['url']
+            if stats is not None: stats['phase']='Читаем RSS: '+url[:90]
             try:
-                response = await client.get(feed_url, headers={'User-Agent': 'Mozilla/5.0 (compatible; NeuroPulseRSS/1.0)'})
+                response=await client.get(url,headers={'User-Agent':'Mozilla/5.0 (compatible; NeuroPulseRSS/2.0)'})
                 response.raise_for_status()
-                feed = feedparser.parse(response.content)
-                if feed.bozo and not feed.entries:
-                    raise ValueError('Некорректный RSS/Atom')
-                if not feed.entries:
-                    raise ValueError('RSS не содержит записей')
-                for entry in feed.entries[:10]:
-                    url = entry.get('link', '')
-                    if not url.startswith(('https://', 'http://')):
-                        continue
-                    if stats is not None:
-                        stats['found'] += 1
-                    url = canonical_url(url)
-                    fingerprint = hashlib.sha256((str(channel_id) + '|' + url).encode()).hexdigest()
-                    title = html.unescape(re.sub('<[^>]+>', '', entry.get('title', '')))[:250]
-                    summary = feed_summary(entry)
-                    published=entry.get('published_parsed') or entry.get('updated_parsed')
-                    published_at=datetime.fromtimestamp(calendar.timegm(published),timezone.utc).isoformat() if published else None
+                feed=feedparser.parse(response.content)
+                if not feed.entries: raise ValueError('Лента не содержит записей')
+                for entry in feed.entries[:100]:
+                    link=entry.get('link','')
+                    if not link.startswith(('http://','https://')): continue
+                    link=canonical_url(link)
+                    title=html.unescape(re.sub('<[^>]+>','',entry.get('title','')))[:250]
+                    summary=feed_summary(entry)
+                    parsed=entry.get('published_parsed') or entry.get('updated_parsed')
+                    published=datetime.fromtimestamp(calendar.timegm(parsed),timezone.utc).isoformat() if parsed else None
+                    fingerprint=hashlib.sha256((str(channel_id)+'|'+link).encode()).hexdigest()
+                    if stats is not None: stats['found']+=1
                     with db() as con:
-                        existing=con.execute('SELECT id,status,source_summary FROM posts WHERE channel_id=? AND (fingerprint=? OR url=?)', (channel_id, fingerprint, url)).fetchone()
-                        if existing:
-                            if published_at:
-                                con.execute('UPDATE posts SET source_published_at=COALESCE(source_published_at,?) WHERE id=?',(published_at,existing['id']))
-                            if existing['status']=='draft' and summary and (not existing['source_summary'] or len(summary)>len(existing['source_summary'])+200):
-                                con.execute("UPDATE posts SET source_summary=?,ai_status='pending',ai_score=NULL,ai_text_hash='',reviewed_at=NULL,ai_reason='Получено более полное описание RSS — нужна повторная оценка' WHERE id=?",(summary,existing['id']))
-                            if stats is not None: stats['duplicates'] += 1
+                        old=con.execute('SELECT * FROM posts WHERE channel_id=? AND (url=? OR fingerprint=?)',(channel_id,link,fingerprint)).fetchone()
+                        if old:
+                            if published: con.execute('UPDATE posts SET source_published_at=COALESCE(source_published_at,?) WHERE id=?',(published,old['id']))
+                            if old['status']=='draft' and summary and (not old['source_summary'] or len(summary)>len(old['source_summary'])+200):
+                                con.execute("UPDATE posts SET source_summary=?,ai_status='pending',ai_text_hash='',review_after=NULL,review_attempts=0,ai_reason='Дополнен исходный материал — редактор проверит автоматически' WHERE id=?",(summary,old['id']))
+                            if stats is not None: stats['duplicates']+=1
                             continue
-                    if not interesting(title, summary, channel):
-                        if stats is not None: stats['filtered'] += 1
-                        continue
-                    if stats is not None:
-                        stats['phase'] = 'Ollama: ' + title[:80]
-                    published=entry.get('published_parsed') or entry.get('updated_parsed')
-                    published_at=datetime.fromtimestamp(calendar.timegm(published),timezone.utc).isoformat() if published else None
-                    verdict=None
-                    if published_at and utcnow()-datetime.fromisoformat(published_at)>timedelta(hours=72):
-                        ai_status,content,reason,score='rejected',title+'\n\n'+summary[:900], 'Старше 72 часов',0
-                    else:
-                        try:
-                            verdict=await review(title,summary,channel['editorial_brief'])
-                            ai_status,content,reason,score=ai_result(verdict,url,channel['min_score'])
-                        except EditorialUnavailable as exc:
-                            ai_status,content,reason,score='pending',title+'\n\n'+summary[:900],str(exc),None
-                            if stats is not None: stats['errors'].append(title[:60]+': '+str(exc))
-                    if not content: content=title+'\n\n'+summary[:900]
-                    with db() as con:
-                        latest=con.execute('SELECT * FROM channels WHERE id=?',(channel_id,)).fetchone()
-                        if any(latest[k]!=channel[k] for k in ('editorial_brief','keywords','exclude_keywords','min_score')):
-                            ai_status,reason='pending','Настройки редактора изменились во время сбора — нужна повторная оценка'
-                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,ai_status,ai_score,ai_reason,ai_text_hash,source_summary,source_published_at,reviewed_at,editorial_revision,news_event,news_evidence) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (channel_id,title,content,url,fingerprint,feed_image(entry),ai_status,score,reason,text_hash(content) if ai_status=='approved' else '',summary,published_at,utcnow().isoformat(),NEWS_REVISION,verdict.event if verdict else '',verdict.evidence if verdict else ''))
+                        reason=None
+                        if not is_ai_story(title,summary): reason='Не новость об ИИ: основная тема не связана с искусственным интеллектом'
+                        elif not interesting(title,summary,channel): reason='Не соответствует фильтрам канала'
+                        elif published and utcnow()-datetime.fromisoformat(published)>timedelta(hours=48): reason='Новость старше 48 часов'
+                        state='rejected' if reason else 'pending'
+                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,source_summary,source_published_at,ai_status,ai_reason,ai_score,editorial_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (channel_id,title,title+'\n\n'+summary[:900],link,fingerprint,feed_image(entry),summary,published,state,reason or 'Ожидает проверки редактором',0 if reason else None,NEWS_REVISION))
                         added+=cur.rowcount
                         if stats is not None:
                             stats['added']+=cur.rowcount
-                            if ai_status=='rejected': stats['filtered']+=cur.rowcount
-                    if cur.rowcount: event(ai_status,reason,channel_id,cur.lastrowid)
-                    if stop_after_ready and ai_status=='approved' and published_at and timedelta(0)<=utcnow()-datetime.fromisoformat(published_at)<timedelta(hours=48):
-                        return added
+                            if reason: stats['filtered']+=cur.rowcount
+                with db() as con: con.execute('UPDATE sources SET last_checked_at=?,last_error=NULL WHERE id=?',(utcnow().isoformat(),source['id']))
             except Exception as exc:
-                error = feed_url + ': ' + str(exc)[:180]
-                print('Feed error:', error, flush=True)
-                if stats is not None: stats['errors'].append(error)
+                message=url+': '+str(exc)[:160]
+                with db() as con: con.execute('UPDATE sources SET last_checked_at=?,last_error=? WHERE id=?',(utcnow().isoformat(),message,source['id']))
+                if stats is not None: stats['errors'].append(message)
             finally:
-                if stats is not None: stats['sources_done'] += 1
+                if stats is not None: stats['sources_done']+=1
+    REVIEW_STATE['running']=True
+    await review_pending(channel_id=channel_id,target=1 if stop_after_ready else QUEUE_TARGET)
     return added
 
 PUBLISH_LOCK = asyncio.Lock()
@@ -308,12 +291,14 @@ def automation_ready(channel, now):
 
 
 def auto_candidate(row,channel,now):
+    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): return False
     if row['editorial_revision']!=NEWS_REVISION or not row['news_event'] or not row['news_evidence']: return False
     if not row['source_published_at']: return False
     if datetime.fromisoformat(row['source_published_at'])>now+timedelta(minutes=15): return False
     if row['ai_status']!='approved' or row['ai_score'] is None or row['ai_score']<channel['min_score']: return False
     if not interesting(row['title'] or '',row['source_summary'] or row['text'],channel): return False
     if row['ai_text_hash']!=text_hash(row['text']) or not row['reviewed_at'] or row['error']: return False
+    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): raise ValueError('Это не новость об ИИ — отправка заблокирована')
     if not validate_copy(clean_post(row['text'])): return False
     if now-datetime.fromisoformat(row['reviewed_at'])>timedelta(hours=24): return False
     created=datetime.fromisoformat(row['created_at'].replace(' ','T')).replace(tzinfo=timezone.utc)
@@ -325,8 +310,7 @@ def auto_candidate(row,channel,now):
     for other in previous:
         other_title=re.sub(r'\W+',' ',other['title'] or '').strip().casefold()
         if row['url'] and other['url'] and canonical_url(row['url'])==canonical_url(other['url']): return False
-        if title and title==other_title: return False
-        if len(title)>15 and SequenceMatcher(None,title,other_title).ratio()>.9: return False
+        if same_event(title,other_title): return False
     return True
 
 
@@ -347,6 +331,7 @@ async def _publish(post_id, automatic=False):
     if row['text'].startswith('⚠️ Требуется обработка ИИ'): raise ValueError('Сначала обработайте черновик через Ollama')
     if automatic and (not automation_ready(channel,now) or not auto_candidate(row,channel,now)):
         raise ValueError('Пост или расписание не прошли проверку автопубликации')
+    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): raise ValueError('Это не новость об ИИ — отправка заблокирована')
     if not validate_copy(clean_post(row['text'])):
         raise ValueError('Текст содержит инструкции, пересказ статьи или некорректный формат. Редактор подготовит новую версию.')
     if row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or row['ai_text_hash']!=text_hash(row['text']) or not row['news_event'] or not row['news_evidence']:
@@ -370,6 +355,8 @@ async def _publish(post_id, automatic=False):
             con.execute("UPDATE posts SET status='published',published_at=?,remote_id=?,error=NULL WHERE id=?",(now.isoformat(),remote_id,post_id))
             con.execute('UPDATE channels SET verified_chat_id=?,next_publish_at=?,automation_error=NULL WHERE id=? AND chat_id=?',
                 (channel['chat_id'],(now+timedelta(minutes=channel['interval_minutes'])).isoformat(),channel['id'],channel['chat_id']))
+        refresh_reserve()
+        request_refill(force=True)
         event('published','Пост отправлен '+('автоматически' if automatic else 'вручную'),channel['id'],post_id)
         return {'ok':True,'remote_id':remote_id}
     except BaseException as exc:
@@ -399,7 +386,9 @@ async def automation_tick():
             break
 
 async def run_collection(enabled_only=False, channel_id=None, stop_after_ready=False):
+    global LAST_REFILL_AT
     async with COLLECT_LOCK:
+        LAST_REFILL_AT=utcnow()
         COLLECT_STATE.update(running=True, phase='Начинаем сбор', found=0, duplicates=0,
                              added=0, filtered=0, sources_done=0, sources_total=0, errors=[], finished=None)
         try:
@@ -418,6 +407,7 @@ async def run_collection(enabled_only=False, channel_id=None, stop_after_ready=F
 
 async def tick():
     if not COLLECT_LOCK.locked() and not COLLECT_STATE['running'] and not REVIEW_STATE['running']:
+        refresh_reserve()
         COLLECT_STATE['running'] = True
         await run_collection()
         if not REVIEW_STATE['running']:
@@ -428,8 +418,9 @@ async def tick():
 async def lifespan(app):
     init()
     scheduler=AsyncIOScheduler(timezone='UTC')
-    scheduler.add_job(tick,'interval',minutes=30,max_instances=1,coalesce=True)
+    scheduler.add_job(tick,'interval',minutes=15,max_instances=1,coalesce=True)
     scheduler.add_job(automation_tick,'interval',minutes=1,max_instances=1,coalesce=True)
+    scheduler.add_job(maintain_reserve,'interval',minutes=1,max_instances=1,coalesce=True)
     scheduler.start()
     global COLLECT_TASK
     if BACKGROUND_ENABLED: COLLECT_TASK=asyncio.create_task(tick())
@@ -522,7 +513,10 @@ def remove_source(sid:int):
     return {'ok':True}
 @app.get('/api/posts',dependencies=[Depends(auth)])
 def posts():
-    with db() as con: return [dict(x) for x in con.execute("SELECT * FROM posts WHERE status!='deleted' ORDER BY id DESC LIMIT 200")]
+    ready={p['id'] for c in channels() for p in ready_posts(c['id'])}
+    with db() as con: rows=[dict(x) for x in con.execute("SELECT * FROM posts WHERE status!='deleted' ORDER BY id DESC LIMIT 300")]
+    for row in rows: row['queue_ready']=row['id'] in ready
+    return rows
 @app.get('/api/collect/status', dependencies=[Depends(auth)])
 def collect_status():
     return dict(COLLECT_STATE)
@@ -572,6 +566,7 @@ async def delete_post(pid:int):
             # Retain fingerprint to prevent deleted stories from reappearing on the next collection.
             cur=con.execute("UPDATE posts SET status='deleted' WHERE id=? AND status='draft'",(pid,))
             if not cur.rowcount: raise HTTPException(404,'Черновик не найден')
+    request_refill()
     return {'ok':True}
 
 @app.get('/api/health',dependencies=[Depends(auth)])
@@ -598,7 +593,11 @@ async def rewrite_post(pid:int):
             verdict=Verdict(publishable=False,score=0,reason='Не соответствует ключевым словам или исключающим фильтрам канала',text='')
         else:
             verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None)
-    except EditorialUnavailable as exc: raise HTTPException(503,str(exc))
+    except EditorialUnavailable as exc:
+        with db() as con:
+            con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',ai_reason=?,review_attempts=review_attempts+1,review_kind=?,review_after=? WHERE id=? AND status='draft'",
+                (str(exc),exc.kind,(utcnow()+timedelta(minutes=5 if exc.kind=='connection' else (60 if row['review_attempts']>=2 else 15))).isoformat(),pid))
+        raise HTTPException(503,{'message':str(exc),'kind':exc.kind})
     state,text,reason,score=ai_result(verdict,row['url'],channel['min_score'])
     if not text: text=clean_post(row['text'])
     async with PUBLISH_LOCK:
@@ -606,7 +605,7 @@ async def rewrite_post(pid:int):
             latest=con.execute('SELECT editorial_brief,min_score,keywords,exclude_keywords FROM channels WHERE id=?',(channel['id'],)).fetchone()
             if any(latest[k]!=channel[k] for k in ('editorial_brief','min_score','keywords','exclude_keywords')):
                 raise HTTPException(409,'Настройки канала изменены во время оценки. Повторите.')
-            cur=con.execute("UPDATE posts SET text=?,ai_status=?,ai_reason=?,ai_score=?,ai_text_hash=?,reviewed_at=?,editorial_revision=?,news_event=?,news_evidence=?,user_edited=0,error=NULL WHERE id=? AND status='draft' AND text=?",
+            cur=con.execute("UPDATE posts SET text=?,ai_status=?,ai_reason=?,ai_score=?,ai_text_hash=?,reviewed_at=?,editorial_revision=?,news_event=?,news_evidence=?,user_edited=0,review_attempts=review_attempts+1,review_after=NULL,review_kind=NULL,error=NULL WHERE id=? AND status='draft' AND text=?",
                 (text,state,reason,score,text_hash(text) if state=='approved' else '',utcnow().isoformat(),NEWS_REVISION,verdict.event,verdict.evidence,pid,row['text']))
             if not cur.rowcount: raise HTTPException(409,'Черновик изменён во время оценки. Повторите.')
     event(state,reason,channel['id'],pid)
@@ -631,6 +630,8 @@ def overview():
         counts=dict(con.execute("SELECT CASE WHEN status='draft' THEN ai_status ELSE status END,COUNT(*) FROM posts WHERE status!='deleted' GROUP BY 1").fetchall())
         counts['sources']=con.execute('SELECT COUNT(*) FROM sources').fetchone()[0]
         counts['automatic_channels']=con.execute('SELECT COUNT(*) FROM channels WHERE enabled=1 AND autopublish=1').fetchone()[0]
+    counts['approved']=sum(len(ready_posts(c['id'])) for c in channels())
+    counts['queue_target']=QUEUE_TARGET
     return counts
 
 
@@ -648,23 +649,34 @@ async def resolve_post(pid:int,item:ResolveIn):
     event('resolved','Результат отправки подтверждён пользователем',post_id=pid)
     return {'ok':True}
 
-async def review_pending(enabled_only=False, include_rejected=False, channel_id=None):
+async def review_pending(enabled_only=False,include_rejected=False,channel_id=None,target=QUEUE_TARGET):
     try:
         with db() as con:
-            query="SELECT p.id FROM posts p JOIN channels c ON c.id=p.channel_id WHERE p.status='draft' AND " + ("p.ai_status IN ('pending','rejected')" if include_rejected else "p.ai_status='pending'")
+            query="SELECT p.id,p.channel_id,p.source_published_at,p.user_edited FROM posts p JOIN channels c ON c.id=p.channel_id WHERE p.status='draft' AND " + ("p.ai_status IN ('pending','rejected')" if include_rejected else "p.ai_status='pending'")
+            query+=' AND (p.review_after IS NULL OR p.review_after<=?) AND (p.user_edited=1 OR (p.source_published_at>=? AND p.source_published_at<=?))'
+            params=[utcnow().isoformat(),(utcnow()-timedelta(hours=48)).isoformat(),(utcnow()+timedelta(minutes=15)).isoformat()]
             if enabled_only: query+=' AND c.enabled=1'
-            params=[]
             if channel_id is not None:
-                query+=' AND p.channel_id=?'
-                params.append(channel_id)
-            ids=[row['id'] for row in con.execute(query+' ORDER BY p.user_edited DESC,p.source_published_at DESC,p.id DESC LIMIT 30',params)]
-        REVIEW_STATE.update(total=len(ids),done=0,error=None)
-        for pid in ids:
-            try: await rewrite_post(pid)
+                query+=' AND p.channel_id=?';params.append(channel_id)
+            rows=con.execute(query+' ORDER BY p.user_edited DESC,p.source_published_at DESC,p.id DESC LIMIT 60',params).fetchall()
+        REVIEW_STATE.update(total=len(rows),done=0,error=None)
+        for row in rows:
+            ready=prepared_posts(row['channel_id'])
+            required=target+2 if target==QUEUE_TARGET else target
+            if len(ready)>=required and not row['user_edited']:
+                oldest=ready[-1]['source_published_at']
+                if not row['source_published_at'] or row['source_published_at']<=oldest: continue
+            if COLLECT_STATE['running']: COLLECT_STATE['phase']='Редактор: '+str(min(len(ready),QUEUE_TARGET))+'/'+str(QUEUE_TARGET)+' готово'+(' · готовим запас' if len(ready)>=QUEUE_TARGET else ' · пополняем резерв')
+            try:
+                await rewrite_post(row['id'])
+                trim_reserve(row['channel_id'],target=QUEUE_TARGET)
             except HTTPException as exc:
+                detail=exc.detail
                 if exc.status_code==503:
-                    REVIEW_STATE['error']=str(exc.detail)
-                    break
+                    message=detail.get('message','Ошибка редактора') if isinstance(detail,dict) else str(detail)
+                    REVIEW_STATE['error']=message
+                    if isinstance(detail,dict) and detail.get('kind')=='connection': break
+                    # A bad generation/fragment on one item must not stop the next good news item.
             REVIEW_STATE['done']+=1
     finally: REVIEW_STATE['running']=False
 
@@ -750,3 +762,86 @@ async def publish_one(cid:int):
 @app.get('/api/publish-jobs',dependencies=[Depends(auth)])
 def publish_jobs():
     return {str(cid):dict(job) for cid,job in ONE_JOBS.items()}
+
+
+def prepared_posts(cid,include_standby=True):
+    now=utcnow()
+    with db() as con:
+        channel=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
+        if not channel: return []
+        states="('approved','standby')" if include_standby else "('approved')"
+        rows=con.execute("SELECT * FROM posts WHERE channel_id=? AND status='draft' AND ai_status IN "+states+" ORDER BY source_published_at DESC,ai_score DESC,id DESC",(cid,)).fetchall()
+    result=[]
+    for row in rows:
+        candidate=dict(row);candidate['ai_status']='approved'
+        if not auto_candidate(candidate,channel,now): continue
+        title=re.sub(r'\W+',' ',row['title'] or '').casefold()
+        event_name=re.sub(r'\W+',' ',row['news_event'] or '').casefold()
+        if any(same_event(row['title'],p['title']) or same_event(row['news_event'],p['news_event']) for p in result): continue
+        result.append(row)
+    return result
+
+
+def ready_posts(cid):
+    return prepared_posts(cid,include_standby=False)
+
+
+def same_event(left,right):
+    left=re.sub(r'\W+',' ',left or '').strip().casefold()
+    right=re.sub(r'\W+',' ',right or '').strip().casefold()
+    if not left or not right: return False
+    if set(re.findall(r'\d+',left))!=set(re.findall(r'\d+',right)): return False
+    return left==right or (len(left)>20 and SequenceMatcher(None,left,right).ratio()>.94)
+
+
+def trim_reserve(cid,target=QUEUE_TARGET):
+    ready=ready_posts(cid)
+    if len(ready)>target:
+        with db() as con:
+            con.executemany("UPDATE posts SET ai_status='standby' WHERE id=?",[(p['id'],) for p in ready[target:]])
+
+
+def refresh_reserve():
+    now=utcnow()
+    with db() as con:
+        con.execute("UPDATE posts SET ai_status='expired',ai_reason='Срок актуальности истёк — не отправляем' WHERE status='draft' AND ai_status IN ('approved','standby') AND (source_published_at<? OR created_at<?)",
+            ((now-timedelta(hours=48)).isoformat(),(now-timedelta(hours=48)).strftime('%Y-%m-%d %H:%M:%S')))
+        con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',review_after=NULL,ai_reason='Обновляем проверку перед отправкой' WHERE status='draft' AND ai_status IN ('approved','standby') AND reviewed_at<?",((now-timedelta(hours=24)).isoformat(),))
+        ids=[r['id'] for r in con.execute('SELECT id FROM channels')]
+    for cid in ids:
+        count=len(ready_posts(cid))
+        with db() as con:
+            channel=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
+            standby=con.execute("SELECT * FROM posts WHERE channel_id=? AND status='draft' AND ai_status='standby' ORDER BY source_published_at DESC",(cid,)).fetchall()
+            for post in standby:
+                if count>=QUEUE_TARGET: break
+                candidate=dict(post);candidate['ai_status']='approved'
+                if auto_candidate(candidate,channel,now):
+                    con.execute("UPDATE posts SET ai_status='approved' WHERE id=?",(post['id'],));count+=1
+
+
+def request_refill(force=False):
+    global COLLECT_TASK
+    if not force and LAST_REFILL_AT and utcnow()-LAST_REFILL_AT<timedelta(minutes=5): return
+    if BACKGROUND_ENABLED and not COLLECT_LOCK.locked() and (not COLLECT_TASK or COLLECT_TASK.done()):
+        COLLECT_TASK=asyncio.create_task(tick())
+
+
+async def maintain_reserve():
+    refresh_reserve()
+    with db() as con:
+        ids=[r['id'] for r in con.execute('SELECT DISTINCT c.id FROM channels c JOIN sources s ON s.channel_id=c.id')]
+    if any(len(ready_posts(cid))<QUEUE_TARGET for cid in ids): request_refill()
+
+
+@app.get('/api/queue/status',dependencies=[Depends(auth)])
+def queue_status():
+    result=[]
+    with db() as con:
+        rows=con.execute('SELECT c.*,COUNT(s.id) AS source_count FROM channels c LEFT JOIN sources s ON s.channel_id=c.id GROUP BY c.id').fetchall()
+        errors=[dict(r) for r in con.execute('SELECT channel_id,url,last_error,last_checked_at FROM sources WHERE last_error IS NOT NULL')]
+    for channel in rows:
+        if not channel['source_count'] and not channel['chat_id'] and channel['id']!=1: continue
+        count=len(ready_posts(channel['id']))
+        result.append({'channel_id':channel['id'],'name':channel['name'],'ready':count,'target':QUEUE_TARGET,'missing':max(0,QUEUE_TARGET-count)})
+    return {'channels':result,'running':COLLECT_STATE['running'] or REVIEW_STATE['running'],'source_errors':errors,'target':QUEUE_TARGET,'last_error':REVIEW_STATE.get('error')}
