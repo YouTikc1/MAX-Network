@@ -3,6 +3,8 @@ import os, sqlite3, hashlib, secrets, asyncio, re, html
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import calendar
+import json
+from publication import message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -53,7 +55,10 @@ def init():
         if 'image_url' not in columns: con.execute("ALTER TABLE posts ADD COLUMN image_url TEXT DEFAULT ''")
         if 'image_approved' not in columns: con.execute('ALTER TABLE posts ADD COLUMN image_approved INTEGER DEFAULT 0')
         new_automation = 'verified_chat_id' not in channel_columns
+        new_signature = 'channel_url' not in channel_columns
         channel_fields = {
+            'channel_url':"TEXT NOT NULL DEFAULT ''",
+            'signature_text':"TEXT NOT NULL DEFAULT ''",
             'editorial_brief': "TEXT NOT NULL DEFAULT '"+DEFAULT_EDITORIAL_BRIEF+"'",
             'min_score': 'INTEGER NOT NULL DEFAULT 75',
             'interval_minutes': 'INTEGER NOT NULL DEFAULT 60',
@@ -74,12 +79,16 @@ def init():
             'publish_mode': 'TEXT', 'editorial_revision':'INTEGER NOT NULL DEFAULT 0',
             'news_event':"TEXT NOT NULL DEFAULT ''", 'news_evidence':"TEXT NOT NULL DEFAULT ''",
             'user_edited':'INTEGER NOT NULL DEFAULT 0',
+            'remote_ids':"TEXT NOT NULL DEFAULT '[]'",
             'review_attempts':'INTEGER NOT NULL DEFAULT 0', 'review_after':'TEXT', 'review_kind':'TEXT',
         }
         for name, definition in post_fields.items():
             if name not in columns: con.execute(f'ALTER TABLE posts ADD COLUMN {name} {definition}')
         con.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, message TEXT NOT NULL, channel_id INTEGER, post_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
         con.execute("UPDATE posts SET ai_status='pending',ai_score=NULL,ai_text_hash='',ai_reason='Обновлена проверка новостей — редактор проверит автоматически' WHERE status='draft' AND editorial_revision<?",(NEWS_REVISION,))
+        con.execute("CREATE TABLE IF NOT EXISTS post_deliveries (id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL, part_index INTEGER NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', message_id TEXT, error TEXT, UNIQUE(post_id,part_index))")
+        con.execute("UPDATE post_deliveries SET status='uncertain',error='Отправка прервана — проверьте канал MAX' WHERE status='sending'")
+        if new_signature: con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE id=1 OR lower(name) LIKE 'neuropulse%'",(PRIMARY_CHANNEL_URL,PRIMARY_SIGNATURE))
         source_columns={r[1] for r in con.execute('PRAGMA table_info(sources)')}
         for name in ('last_checked_at','last_error'):
             if name not in source_columns: con.execute(f'ALTER TABLE sources ADD COLUMN {name} TEXT')
@@ -97,6 +106,7 @@ def init():
             return
         for cid, name in [(1,'Нейросети'),(2,'Технологии')]:
             con.execute('INSERT OR IGNORE INTO channels(id,name,chat_id) VALUES (?,?,?)',(cid,name,os.getenv(f'MAX_CHAT_ID_{cid}','')))
+        if new_signature: con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE id=1 OR lower(name) LIKE 'neuropulse%'",(PRIMARY_CHANNEL_URL,PRIMARY_SIGNATURE))
 
 def auth(authorization: Optional[str] = Header(None)):
     if not PASSWORD or not authorization or not authorization.startswith('Basic '):
@@ -115,6 +125,8 @@ class SourceIn(BaseModel):
 class ChannelIn(BaseModel):
     name: str
     chat_id: str = ''
+    channel_url: str = Field(default='',max_length=2048)
+    signature_text: str = Field(default='',max_length=160)
     enabled: bool = False
     autopublish: bool = False
     keywords: str = ''
@@ -186,7 +198,7 @@ def feed_summary(entry):
         value=html.unescape(re.sub('<[^>]+>',' ',value))
         value=re.sub(r'\s+',' ',value).strip()
         if value: cleaned.append(value)
-    return max(cleaned,key=len)[:6000] if cleaned else ''
+    return max(cleaned,key=len)[:12000] if cleaned else ''
 
 
 def canonical_url(url):
@@ -204,6 +216,7 @@ def interesting(title, summary, channel):
 def validate_channel(item):
     if not item.name.strip() or len(item.name)>120: raise HTTPException(400,'Название: 1–120 символов')
     if item.chat_id and not re.fullmatch(r'-?\d+',item.chat_id.strip()): raise HTTPException(400,'Chat ID должен быть числом')
+    if item.channel_url and not valid_channel_url(item.channel_url.strip()): raise HTTPException(400,'Подпись должна вести на публичную HTTPS-ссылку max.ru')
     if item.start_hour>=item.end_hour: raise HTTPException(400,'Начало окна должно быть раньше окончания')
     try: ZoneInfo(item.timezone)
     except Exception: raise HTTPException(400,'Неизвестный часовой пояс')
@@ -336,21 +349,29 @@ async def _publish(post_id, automatic=False):
         raise ValueError('Текст содержит инструкции, пересказ статьи или некорректный формат. Редактор подготовит новую версию.')
     if row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or row['ai_text_hash']!=text_hash(row['text']) or not row['news_event'] or not row['news_evidence']:
         raise ValueError('Редактор ещё проверяет новость. Непроверенный текст отправлен не будет.')
-    payload={'text':clean_post(row['text'])}
-    if row['image_url']:
-        payload['attachments']=[{'type':'image','payload':{'url':row['image_url']}}]
+    payloads=message_payloads(clean_post(row['text']),channel['channel_url'],channel['signature_text'] or channel['name'],row['image_url'] or '')
     with db() as con:
         # Durable claim prevents retries after a restart or another worker.
-        cur=con.execute("UPDATE posts SET status='publishing',publish_mode=?,published_chat_id=? WHERE id=? AND status='draft'",
+        cur=con.execute("UPDATE posts SET status='publishing',remote_ids='[]',remote_id=NULL,publish_mode=?,published_chat_id=? WHERE id=? AND status='draft'",
                         ('auto' if automatic else 'manual',channel['chat_id'],post_id))
         if not cur.rowcount: raise ValueError('Отправка уже началась')
+        con.execute('DELETE FROM post_deliveries WHERE post_id=?',(post_id,))
+        con.executemany('INSERT INTO post_deliveries(post_id,part_index,payload_json) VALUES (?,?,?)',[(post_id,i,json.dumps(payload,ensure_ascii=False)) for i,payload in enumerate(payloads)])
+    remote_ids=[]
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response=await client.post(f'{API}/messages',params={'chat_id':channel['chat_id']},headers={'Authorization':TOKEN},json=payload)
-            response.raise_for_status()
-            data=response.json()
-        remote_id=str(data.get('message',{}).get('body',{}).get('mid',''))
-        if not remote_id: raise ValueError('MAX не вернул идентификатор сообщения')
+            for part_index,payload in enumerate(payloads):
+                with db() as con:
+                    con.execute("UPDATE post_deliveries SET status='sending' WHERE post_id=? AND part_index=?",(post_id,part_index))
+                response=await client.post(f'{API}/messages',params={'chat_id':channel['chat_id'],'disable_link_preview':'true'},headers={'Authorization':TOKEN},json=payload)
+                response.raise_for_status()
+                remote_id=str(response.json().get('message',{}).get('body',{}).get('mid',''))
+                if not remote_id: raise ValueError('MAX не вернул идентификатор сообщения')
+                remote_ids.append(remote_id)
+                with db() as con:
+                    con.execute("UPDATE post_deliveries SET status='published',message_id=? WHERE post_id=? AND part_index=?",(remote_id,post_id,part_index))
+                    con.execute('UPDATE posts SET remote_ids=? WHERE id=?',(json.dumps(remote_ids),post_id))
+        remote_id=remote_ids[0]
         with db() as con:
             con.execute("UPDATE posts SET status='published',published_at=?,remote_id=?,error=NULL WHERE id=?",(now.isoformat(),remote_id,post_id))
             con.execute('UPDATE channels SET verified_chat_id=?,next_publish_at=?,automation_error=NULL WHERE id=? AND chat_id=?',
@@ -358,12 +379,14 @@ async def _publish(post_id, automatic=False):
         refresh_reserve()
         request_refill(force=True)
         event('published','Пост отправлен '+('автоматически' if automatic else 'вручную'),channel['id'],post_id)
-        return {'ok':True,'remote_id':remote_id}
+        return {'ok':True,'remote_id':remote_id,'remote_ids':remote_ids,'parts':len(remote_ids)}
     except BaseException as exc:
-        certain=isinstance(exc,httpx.HTTPStatusError) and 400<=exc.response.status_code<500
+        certain=not remote_ids and isinstance(exc,httpx.HTTPStatusError) and 400<=exc.response.status_code<500
         state='draft' if certain else 'uncertain'
         message=('MAX отклонил запрос' if certain else 'Результат отправки неизвестен. Проверьте канал MAX, затем подтвердите результат в панели.')
+        if remote_ids: message=f'Отправлено частей {len(remote_ids)} из {len(payloads)}. Не повторяйте новость: сначала проверьте канал MAX.'
         with db() as con:
+            con.execute("UPDATE post_deliveries SET status=?,error=? WHERE post_id=? AND status='sending'",('failed' if certain else 'uncertain',message,post_id))
             con.execute('UPDATE posts SET status=?,error=? WHERE id=?',(state,message,post_id))
             if automatic: con.execute('UPDATE channels SET autopublish=0,automation_error=?,next_publish_at=NULL WHERE id=?',(message,channel['id']))
         event('error',message,channel['id'],post_id)
@@ -450,6 +473,11 @@ def save_channel(item, cid=None):
     with db() as con:
         current=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone() if cid else None
         if cid and not current: raise HTTPException(404,'Канал не найден')
+        if current:
+            for field in ('channel_url','signature_text'):
+                if field not in item.model_fields_set: values[field]=current[field]
+        values['channel_url']=values['channel_url'].strip()
+        values['signature_text']=values['signature_text'].strip()
         if item.autopublish:
             if not item.enabled or not TOKEN or not item.chat_id: raise HTTPException(400,'Включите канал и задайте Chat ID и токен')
             if con.execute("SELECT 1 FROM posts WHERE channel_id=? AND status='uncertain'",(cid,)).fetchone():
@@ -533,7 +561,7 @@ async def collect_now():
 async def edit_post(pid:int,item:dict):
     if PUBLISH_LOCK.locked(): raise HTTPException(409,'Дождитесь завершения публикации')
     value=clean_post(item.get('text',''))
-    if not value or len(value)>4000: raise HTTPException(400,'Text must be 1-4000 characters')
+    if not value: raise HTTPException(400,'Текст не должен быть пустым')
     image_url=str(item.get('image_url','')).strip()
     if image_url and not safe_image_url(image_url): raise HTTPException(400,'Image must be a public HTTPS URL')
     approved=int(bool(item.get('image_approved',False))) if image_url else 0
@@ -637,12 +665,16 @@ def overview():
 
 class ResolveIn(BaseModel):
     published: bool
+    parts_removed: bool = False
 
 
 @app.post('/api/posts/{pid}/resolve',dependencies=[Depends(auth)])
 async def resolve_post(pid:int,item:ResolveIn):
     async with PUBLISH_LOCK:
         with db() as con:
+            row=con.execute('SELECT remote_ids FROM posts WHERE id=?',(pid,)).fetchone()
+            if row and json.loads(row['remote_ids'] or '[]') and not item.published and not item.parts_removed:
+                raise HTTPException(409,'Часть новости уже опубликована. Удалите её в MAX и подтвердите это перед повторной отправкой.')
             cur=con.execute("UPDATE posts SET status=?,published_at=?,error=NULL WHERE id=? AND status='uncertain'",
                 ('published' if item.published else 'draft',utcnow().isoformat() if item.published else None,pid))
             if not cur.rowcount: raise HTTPException(404,'Нет отправки, требующей сверки')

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#f6f7fb"><title>MAX Network · Редакция</title>
-  <link rel="stylesheet" href="/static/app.css?v=4">
-  <script src="/static/app.js?v=4" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=5">
+  <script src="/static/app.js?v=5" defer></script>
 </head>
 <body>
 <div class="app-shell">
@@ -35,7 +35,7 @@
           <div class="metric"><div class="metric-label"><span>Каналы на автопилоте</span><i class="metric-icon blue">◈</i></div><strong id="automaticCount">0</strong><small id="sourceMetric">0 подключённых источников</small></div>
         </div>
         <div class="overview-grid">
-          <div class="panel pipeline-panel"><div class="panel-heading"><div><p class="eyebrow">УМНАЯ РЕДАКЦИЯ</p><h2>Только события. Никаких пересказов статей.</h2></div><span class="badge purple-badge">Ollama · локально</span></div><p class="panel-description">Редактор ищет свежее событие об ИИ, сверяет его с RSS и пишет готовую новость. Нажмите «Выложить 1 новость» у канала.</p><div class="pipeline"><div><span class="pipeline-icon">◔</span><strong>Собрать</strong><small>RSS и Atom</small></div><i>→</i><div><span class="pipeline-icon accent">✦</span><strong>Оценить</strong><small>Тема, факты, ценность</small></div><i>→</i><div><span class="pipeline-icon">▤</span><strong>Подготовить</strong><small>Коротко и по-русски</small></div><i>→</i><div><span class="pipeline-icon">↗</span><strong>Опубликовать</strong><small>По вашему расписанию</small></div></div><div class="collection-box"><div class="collection-caption"><strong id="collectPhase">Редакция готова к работе</strong><span id="collectNumbers">Ожидание сбора</span></div><progress id="collectProgress" max="1" value="0"></progress><div id="collectDetails" class="muted small">Обновление лент каждые 15 минут; резерв пополняется после публикации.</div></div></div>
+          <div class="panel pipeline-panel"><div class="panel-heading"><div><p class="eyebrow">УМНАЯ РЕДАКЦИЯ</p><h2>Только события. Никаких пересказов статей.</h2></div><span class="badge purple-badge">Ollama · локально</span></div><p class="panel-description">Редактор ищет свежее событие об ИИ, сверяет его с RSS и пишет полную новость без лимита в 750 символов. Нажмите «Выложить 1 новость» у канала.</p><div class="pipeline"><div><span class="pipeline-icon">◔</span><strong>Собрать</strong><small>RSS и Atom</small></div><i>→</i><div><span class="pipeline-icon accent">✦</span><strong>Оценить</strong><small>Тема, факты, ценность</small></div><i>→</i><div><span class="pipeline-icon">▤</span><strong>Подготовить</strong><small>Полно и по существу</small></div><i>→</i><div><span class="pipeline-icon">↗</span><strong>Опубликовать</strong><small>По вашему расписанию</small></div></div><div class="collection-box"><div class="collection-caption"><strong id="collectPhase">Редакция готова к работе</strong><span id="collectNumbers">Ожидание сбора</span></div><progress id="collectProgress" max="1" value="0"></progress><div id="collectDetails" class="muted small">Обновление лент каждые 15 минут; резерв пополняется после публикации.</div></div></div>
           <div class="panel autopilot-panel"><div class="panel-heading"><h2>Автопилот</h2><span id="autoBadge" class="badge neutral">На паузе</span></div><div id="scheduleList" class="schedule-list"></div><a class="text-link" href="#channels">Настроить расписание <span>→</span></a><div class="quiet-note">Mac, сервер и Ollama должны оставаться включёнными. Вне заданных часов отправки не будет.</div></div>
         </div>
         <div class="section-heading"><h2>Выбор редактора <span id="featuredCount" class="count-tag">0</span></h2><a href="#queue" class="text-link">Вся очередь →</a></div><div id="featuredPosts" class="post-grid"></div>

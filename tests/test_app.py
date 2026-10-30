@@ -125,7 +125,6 @@ def test_two_stage_news_and_no_source_footer(client,monkeypatch):
     '### Заголовок\n'+COPY,
     COPY+'\nИсточник: https://news.example/story',
     'Only English text. '*20,
-    COPY*5,
 ])
 def test_instruction_leak_and_article_recaps_never_approved(client,monkeypatch,copy):
     calls=network(monkeypatch,copy=copy)
@@ -184,7 +183,8 @@ def test_publish_one_works_without_channel_enable_or_photo_checkbox(client,monke
     sends=[r for r in calls if r.url.host=='platform-api.max.ru']
     assert len(sends)==1
     body=json.loads(sends[0].content)
-    assert body['text']==COPY and 'Источник' not in body['text']
+    assert body['text'].startswith(COPY+'\n\n<a ') and 'Источник' not in body['text']
+    assert body['format']=='html' and 'https://max.ru/channel_neuropulse' in body['text']
     assert body['attachments'][0]['payload']['url']=='https://news.example/photo.jpg'
 
 
@@ -278,7 +278,7 @@ def test_direct_publish_rechecks_bad_legacy_text(client,monkeypatch):
     calls=network(monkeypatch)
     assert client.post(f'/api/posts/{pid}/publish').status_code==200
     sent=[r for r in calls if r.url.host=='platform-api.max.ru']
-    assert json.loads(sent[0].content)['text']==COPY
+    assert json.loads(sent[0].content)['text'].startswith(COPY+'\n\n<a ')
 
 
 def test_concurrent_send_is_once(client,monkeypatch):
@@ -482,3 +482,104 @@ def test_expired_news_leaves_ready_reserve(client,monkeypatch):
     module.refresh_reserve()
     assert module.ready_posts(1)==[]
     assert client.get('/api/posts').json()[0]['ai_status']=='expired'
+
+
+def test_primary_signature_is_correct_and_preserved_by_old_clients(client):
+    channel=client.get('/api/channels').json()[0]
+    assert channel['channel_url']=='https://max.ru/channel_neuropulse'
+    assert channel['signature_text']=='NeuroPulse | Нейросети и ИИ'
+    assert client.put('/api/channels/1',json={'name':'NeuroPulse','chat_id':'-123'}).status_code==200
+    assert client.get('/api/channels').json()[0]['channel_url']==channel['channel_url']
+    assert client.put('/api/channels/1',json={'name':'N','channel_url':'javascript:alert(1)'}).status_code==400
+
+
+def test_new_post_longer_than_750_is_kept(client,monkeypatch):
+    long_copy='\n\n'.join(COPY.replace('Компания',f'Компания Product{i}') for i in range(8))
+    network(monkeypatch,copy=long_copy)
+    result=asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
+    assert len(result.text)>750 and result.text==long_copy
+
+
+def test_html_payloads_keep_all_characters_and_put_link_after_news():
+    from publication import message_payloads,footer,units
+    import html
+    text=('Новая модель ИИ: <тест> & данные 😀. '+'Все характеристики и условия сохранены. '*12+'\n\n')*30
+    signature=footer('https://max.ru/channel_neuropulse','NeuroPulse | Нейросети и ИИ')
+    parts=message_payloads(text,'https://max.ru/channel_neuropulse','NeuroPulse | Нейросети и ИИ','https://news.example/photo.jpg')
+    assert len(parts)>1
+    assert all(p['format']=='html' and units(p['text'])<=4000 for p in parts)
+    assert parts[-1]['text'].endswith(signature)
+    assert all(signature not in p['text'] for p in parts[:-1])
+    reconstructed=''.join(p['text'] if i<len(parts)-1 else p['text'][:-len(signature)] for i,p in enumerate(parts))
+    assert html.unescape(reconstructed)==text
+    assert 'attachments' in parts[0] and all('attachments' not in p for p in parts[1:])
+    assert '&lt;тест&gt; &amp;' in reconstructed
+
+
+def test_signature_text_is_html_escaped():
+    from publication import message_payloads
+    parts=message_payloads(COPY,'https://max.ru/channel_neuropulse','<NeuroPulse> & ИИ')
+    assert '<b>&lt;NeuroPulse&gt; &amp; ИИ</b>' in parts[0]['text']
+    assert '<NeuroPulse>' not in parts[0]['text']
+
+
+def test_long_publish_sends_all_parts_and_records_ids(client,monkeypatch):
+    from publication import message_payloads
+    configure(client,monkeypatch)
+    long_text='\n\n'.join(COPY.replace('Компания',f'Компания Product{i}') for i in range(40))
+    pid=post(text=long_text,ai_text_hash=editorial.text_hash(long_text),image_url='https://news.example/photo.jpg')
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200,json={'message':{'body':{'mid':'part-'+str(len(calls))}}})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    response=client.post(f'/api/posts/{pid}/publish')
+    assert response.status_code==200
+    assert response.json()['parts']==len(calls)>1
+    saved=client.get('/api/posts').json()[0]
+    assert saved['text']==long_text and saved['status']=='published'
+    assert json.loads(saved['remote_ids'])==['part-'+str(i+1) for i in range(len(calls))]
+    with module.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM post_deliveries WHERE post_id=? AND status='published'",(pid,)).fetchone()[0]==len(calls)
+    assert client.post(f'/api/posts/{pid}/publish').status_code==400
+    assert len(calls)==response.json()['parts']
+
+
+def test_partial_long_post_failure_cannot_be_automatically_repeated(client,monkeypatch):
+    configure(client,monkeypatch,True)
+    long_text='\n\n'.join(COPY for _ in range(30))
+    pid=post(text=long_text,ai_text_hash=editorial.text_hash(long_text))
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        if len(calls)==2:return httpx.Response(400,json={})
+        return httpx.Response(200,json={'message':{'body':{'mid':'first-part'}}})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    asyncio.run(module.automation_tick());asyncio.run(module.automation_tick())
+    saved=client.get('/api/posts').json()[0]
+    assert saved['status']=='uncertain' and json.loads(saved['remote_ids'])==['first-part']
+    assert 'Отправлено частей 1' in saved['error']
+    assert client.get('/api/channels').json()[0]['autopublish']==0
+    assert len(calls)==2
+    assert client.post(f'/api/posts/{pid}/publish').status_code==400
+    assert len(calls)==2
+
+
+def test_generation_token_limit_retries_instead_of_publishing_cut_text(client):
+    long_copy=COPY*10
+    calls=[]
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200,json={'response':json.dumps({'text':long_copy}),'done_reason':'length' if len(calls)==1 else 'stop'})
+    async def run():
+        async with CLIENT(transport=httpx.MockTransport(handler)) as c:
+            return await editorial.generate(c,'write',{'source':SOURCE},editorial.PostCopy)
+    result=asyncio.run(run())
+    assert result.text==long_copy
+    assert [r['options']['num_predict'] for r in calls]==[2048,4096]
+
+
+def test_partial_retry_requires_explicit_removed_parts(client,monkeypatch):
+    pid=post(status='uncertain',remote_ids=json.dumps(['already-published']))
+    assert client.post(f'/api/posts/{pid}/resolve',json={'published':False}).status_code==409
+    assert client.post(f'/api/posts/{pid}/resolve',json={'published':False,'parts_removed':True}).status_code==200
