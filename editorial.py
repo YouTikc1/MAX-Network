@@ -4,13 +4,16 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from temporal import copy_date_problem
 from difflib import SequenceMatcher
 
 import httpx
 from pydantic import BaseModel, Field, StrictBool, StrictInt
 
 INFERENCE_LOCK = asyncio.Lock()
-NEWS_REVISION = 7
+NEWS_REVISION = 8
 DEFAULT_EDITORIAL_BRIEF = ('Актуальные новости искусственного интеллекта: кто и что выпустил, объявил, '
     'открыл, изменил или запустил. Конкретные события и проверяемые факты из свежих сообщений. '
     'Без пересказов статей, инструкций, обзоров, рассуждений, рекламы и платных курсов.')
@@ -141,13 +144,15 @@ async def generate(client,system,data,schema):
         return schema.model_validate_json(result['response'])
     raise EditorialUnavailable('Не удалось завершить генерацию.','format')
 
-async def review(title,summary,brief,draft=None,topic="ai",draft_headline=""):
+async def review(title,summary,brief,draft=None,topic="ai",draft_headline="",published_at=None,reference_time=None):
     from topics import matches_topic, PROFILES, default_min_score
     if not matches_topic(title,summary,topic):
         return Verdict(publishable=False,score=0,reason='Материал не соответствует тематике канала',text='')
     fragments=source_fragments(title,summary)
-    content_source={'title':title,'body':summary[:12000]}
-    source={**content_source,'fragments':fragments}
+    now=reference_time or datetime.now(timezone.utc)
+    content_source={'title':title,'body':summary[:12000],'published_at':published_at}
+    time_context={'current_time':now.astimezone(ZoneInfo('Europe/Moscow')).isoformat(),'timezone':'Europe/Moscow','source_published_at':published_at}
+    source={**content_source,'fragments':fragments,'time_context':time_context}
     judge=(
         'Ты новостной редактор канала об ИИ. Найди в материале конкретное НОВОЕ СОБЫТИЕ: '
         'кто выпустил, объявил, запустил, открыл доступ, опубликовал результаты нового исследования, '
@@ -221,6 +226,17 @@ async def review(title,summary,brief,draft=None,topic="ai",draft_headline=""):
         'Если конкретной цифры нет в источнике, убери именно её, сохранив подтверждённую суть новости; '
         'не отклоняй весь материал только потому, что он о финансах. '
         'Не путай дату публикации с датой события.')
+    date_rules=(
+        ' Используй time_context как текущее время, а article.published_at — только как дату публикации, не события. '
+        'Не придумывай годы, даты, город сообщения, причины решения или последствия. '
+        'Не добавляй служебные строки вроде «Москва, 30 декабря 2023 года». '
+        'Не подменяй старый год текущим и не превращай архивное событие в свежую новость. '
+        'Если речь о старом событии без нового объявления, publishable=false. '
+        'Исторические данные в свежей отчётности и явно объявленные планы на будущую дату допустимы, '
+        'если контекст и даты подтверждены материалом. Не выдавай их за произошедшее сегодня.')
+    judge += date_rules
+    writer += date_rules
+    copy_check += date_rules
     judge += numeric_rules
     writer += numeric_rules
     copy_check += numeric_rules
@@ -239,26 +255,30 @@ async def review(title,summary,brief,draft=None,topic="ai",draft_headline=""):
                     evidence=support_text(decision,fragments)
                     if not evidence or not decision.event.strip():
                         raise EditorialUnavailable('Модель не указала допустимые фрагменты события. Попробуем другую новость и повторим проверку позже.','format')
-                if draft and validate_copy(clean_post(draft)):
+                if draft and validate_copy(clean_post(draft)) and not copy_date_problem(clean_post(draft),title,summary):
                     check=await generate(client,
                         copy_check,
-                        {'article':content_source,'event':decision.event,'draft':clean_post(draft)},CopyCheck)
+                        {'article':content_source,'time_context':time_context,'event':decision.event,'draft':clean_post(draft)},CopyCheck)
                     if check.valid:
                         return Verdict(publishable=True,score=decision.score,reason=decision.reason,text=clean_post(draft),event=decision.event,evidence=evidence,headline=draft_headline if draft_headline and clean_post(draft).startswith(draft_headline+'\n\n') else '')
                 # Retry bad generation once. Never substitute instructions or raw RSS as approved copy.
                 problem=''
                 previous=''
                 for attempt in range(2):
-                    copy=await generate(client,writer,{'event':decision.event,'evidence':evidence,'article':content_source,'previous_attempt':previous,'fix_problem':problem},PostCopy)
+                    copy=await generate(client,writer,{'event':decision.event,'evidence':evidence,'article':content_source,'time_context':time_context,'previous_attempt':previous,'fix_problem':problem},PostCopy)
                     previous=copy.model_dump()
                     try: text,headline=compose_copy(copy)
                     except ValueError:
                         problem='Верни короткий заголовок без разметки в headline или пустую строку; в text — только основной текст.'
                         continue
+                    date_issue=copy_date_problem(text,title,summary)
+                    if date_issue:
+                        problem=date_issue
+                        continue
                     if validate_copy(text):
                         check=await generate(client,
                             copy_check,
-                            {'article':content_source,'event':decision.event,'draft':text},CopyCheck)
+                            {'article':content_source,'time_context':time_context,'event':decision.event,'draft':text},CopyCheck)
                         if not check.valid:
                             problem=check.reason
                             continue

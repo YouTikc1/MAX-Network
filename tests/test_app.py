@@ -1001,3 +1001,135 @@ def test_new_economic_channel_defaults_and_omitted_threshold_preservation(client
     assert client.put(f'/api/channels/{cid}',json={'name':'Финансы','topic':'finance','min_score':80}).status_code==200
     assert client.put(f'/api/channels/{cid}',json={'name':'Финансы','topic':'finance'}).status_code==200
     assert next(c for c in client.get('/api/channels').json() if c['id']==cid)['min_score']==80
+
+
+@pytest.mark.parametrize('bad',[
+    'Мосбиржа объявила об изменении торгов. Москва, 30 декабря 2023 года.',
+    'Мосбиржа объявила об изменении торгов 30 декабря 2023 года.',
+    'Компания открыла новый офис в 2023 году для обслуживания клиентов.',
+    'Банк объявил решение 03.11.2023 для всех пользователей.',
+    'Банк объявил решение 2023-11-03 для всех пользователей.',
+])
+def test_unsupported_dates_fail_independently_of_model_approval(client,monkeypatch,bad):
+    network(monkeypatch,copy=bad,headline='')
+    with pytest.raises(editorial.EditorialUnavailable):
+        asyncio.run(editorial.review('Мосбиржа объявила изменение ставки', 'Мосбиржа сообщила о новой ставке для участников рынка.', 'Финансы',topic='finance'))
+
+
+@pytest.mark.parametrize('copy,source',[
+    ('Выручка компании в 2023 году составила 15 млрд рублей.', 'Компания опубликовала отчёт: выручка в 2023 году составила 15 млрд рублей.'),
+    ('Компания объявила запуск 31 декабря 2027 года.', 'Компания объявила запуск 31 декабря 2027 года.'),
+    ('Банк объявил решение 3 ноября 2026 года.', 'Банк объявил решение 03.11.2026.'),
+    ('Компания получила 2000 млн рублей выручки.', 'Компания получила 2 млрд рублей выручки.'),
+])
+def test_source_grounded_dates_and_financial_amounts_are_allowed(copy,source):
+    from temporal import copy_date_problem
+    assert not copy_date_problem(copy,'Компания опубликовала отчёт',source)
+
+
+def test_cannot_replace_an_old_date_with_current_year():
+    from temporal import copy_date_problem
+    assert copy_date_problem('Решение принято 30 декабря 2026 года.', 'Решение биржи','Решение принято 30 декабря 2023 года.')
+
+
+@pytest.mark.parametrize('url',[
+    'https://news.example/2023/12/30/market',
+    'https://news.example/20231230/market',
+    'https://news.example/2023-12-30/market',
+])
+def test_archive_url_is_not_made_fresh_by_feed_timestamp(client,monkeypatch,url):
+    from temporal import source_date_problem
+    now=datetime(2026,11,3,tzinfo=timezone.utc)
+    assert source_date_problem('Банк объявил ставку','Ставка банка изменена.',url,now.isoformat(),now)
+
+
+def test_recent_story_with_historical_comparison_is_not_discarded():
+    from temporal import source_date_problem
+    now=datetime(2026,11,3,tzinfo=timezone.utc)
+    assert not source_date_problem('Компания опубликовала новую отчётность','Прибыль выросла по сравнению с 2023 годом.',
+                                   'https://news.example/2026/11/03/report',now.isoformat(),now)
+
+
+def test_source_old_dateline_is_not_a_current_story():
+    from temporal import source_date_problem
+    now=datetime(2026,11,3,tzinfo=timezone.utc)
+    assert source_date_problem('Банк изменил ставку','МОСКВА, 30 декабря 2023 года. Банк изменил ставку.',
+                               'https://news.example/market',now.isoformat(),now)
+
+
+@pytest.mark.parametrize('automatic',[False,True])
+def test_date_guard_blocks_even_approved_and_hashed_text(client,monkeypatch,automatic):
+    configure(client,monkeypatch,automatic)
+    bad=COPY+' Москва, 30 декабря 2023 года.'
+    pid=post(text=bad,ai_text_hash=editorial.text_hash(bad))
+    calls=network(monkeypatch)
+    if automatic:asyncio.run(module.automation_tick())
+    else:
+        with pytest.raises(ValueError):asyncio.run(module.publish(pid))
+    assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+
+
+def test_updated_only_atom_item_has_no_established_publication_date(client,monkeypatch):
+    now=datetime.now(timezone.utc)
+    atom=f'<feed xmlns="http://www.w3.org/2005/Atom"><title>News</title><entry><id>urn:1</id><title>Компания выпустила модель ИИ</title><link href="https://news.example/old"/><updated>{now.isoformat()}</updated><summary>{SOURCE}</summary></entry></feed>'
+    network(monkeypatch,rss=atom)
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    with module.db() as con:
+        row=con.execute("SELECT * FROM posts WHERE url='https://news.example/old'").fetchone()
+        assert row['source_published_at'] is None and row['ai_status']=='rejected'
+        assert 'Нет даты' in row['ai_reason']
+
+
+def test_original_old_publication_wins_over_recent_update(client,monkeypatch):
+    now=datetime.now(timezone.utc)
+    atom=f'<feed xmlns="http://www.w3.org/2005/Atom"><title>News</title><entry><id>urn:1</id><title>Компания выпустила модель ИИ</title><link href="https://news.example/archive"/><published>2023-12-30T12:00:00Z</published><updated>{now.isoformat()}</updated><summary>{SOURCE}</summary></entry></feed>'
+    network(monkeypatch,rss=atom)
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    with module.db() as con:
+        row=con.execute("SELECT * FROM posts WHERE url='https://news.example/archive'").fetchone()
+        assert row['source_published_at'].startswith('2023-12-30') and row['ai_status']=='rejected'
+
+
+def test_current_time_and_source_publication_are_passed_separately(client,monkeypatch):
+    calls=network(monkeypatch)
+    now=datetime(2026,11,3,12,tzinfo=timezone.utc)
+    published=(now-timedelta(hours=2)).isoformat()
+    verdict=asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ',published_at=published,reference_time=now))
+    assert verdict.publishable
+    prompts=[json.loads(r.content) for r in calls if r.url.path=='/api/generate']
+    for p in prompts:
+        payload=json.loads(p['prompt'])
+        assert payload['article']['published_at']==published
+        context=payload.get('time_context') or payload['article']['time_context']
+        assert context['current_time'].startswith('2026-11-03T15:00:00')
+        assert context['source_published_at']==published
+
+
+def test_bad_date_generation_is_retried_without_changing_it_to_today(client,monkeypatch):
+    versions=iter([
+        {'headline':'','text':COPY+' Москва, 30 декабря 2023 года.'},
+        {'headline':'','text':COPY},
+    ])
+    original=editorial.generate
+    async def generate(client,system,data,schema):
+        if schema is editorial.PostCopy:return editorial.PostCopy(**next(versions))
+        return await original(client,system,data,schema)
+    network(monkeypatch)
+    monkeypatch.setattr(editorial,'generate',generate)
+    verdict=asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
+    assert verdict.publishable and verdict.text==COPY and '2023' not in verdict.text
+
+
+def test_repeat_collection_corrects_wrong_recent_timestamp_without_reviving_archive(client,monkeypatch):
+    pid=post(url='https://news.example/archive',source_published_at=datetime.now(timezone.utc).isoformat())
+    rss=f'<rss version="2.0"><channel><title>News</title><item><title>Компания выпустила новую модель ИИ</title><link>https://news.example/archive</link><pubDate>Sat, 30 Dec 2023 12:00:00 GMT</pubDate><description>{SOURCE}</description></item></channel></rss>'
+    calls=network(monkeypatch,rss=rss)
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    with module.db() as con:
+        row=con.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+        assert row['source_published_at'].startswith('2023-12-30')
+        assert row['ai_status']=='rejected' and not row['ai_text_hash']
+    assert not any(r.url.path=='/api/generate' for r in calls)

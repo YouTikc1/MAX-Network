@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import calendar
 import json
+from temporal import source_date_problem, copy_date_problem
 from topics import PROFILES, CHANNEL_URLS, brief_for, matches_topic, default_min_score
 from publication import selected_images, message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
 from difflib import SequenceMatcher
@@ -296,22 +297,29 @@ async def collect(channel_id, stats=None, stop_after_ready=False,review_after=Tr
                     link=canonical_url(link)
                     title=html.unescape(re.sub('<[^>]+>','',entry.get('title','')))[:250]
                     summary=feed_summary(entry)
-                    parsed=entry.get('published_parsed') or entry.get('updated_parsed')
+                    # updated describes an edit, not the original publication time.
+                    parsed=entry.get('published_parsed')
                     published=datetime.fromtimestamp(calendar.timegm(parsed),timezone.utc).isoformat() if parsed else None
                     fingerprint=hashlib.sha256((str(channel_id)+'|'+link).encode()).hexdigest()
                     if stats is not None: stats['found']+=1
                     with db() as con:
                         old=con.execute('SELECT * FROM posts WHERE channel_id=? AND (url=? OR fingerprint=?)',(channel_id,link,fingerprint)).fetchone()
                         if old:
-                            if published: con.execute('UPDATE posts SET source_published_at=COALESCE(source_published_at,?) WHERE id=?',(published,old['id']))
+                            if published and old['status']=='draft' and (not old['source_published_at'] or published<old['source_published_at']):
+                                con.execute('UPDATE posts SET source_published_at=? WHERE id=?',(published,old['id']))
                             if old['status']=='draft' and summary and (not old['source_summary'] or len(summary)>len(old['source_summary'])+200):
                                 con.execute("UPDATE posts SET source_summary=?,ai_status='pending',ai_text_hash='',review_after=NULL,review_attempts=0,ai_reason='Дополнен исходный материал — редактор проверит автоматически' WHERE id=?",(summary,old['id']))
+                            if old['status']=='draft':
+                                known_date=min(filter(None,(published,old['source_published_at'])),default=None)
+                                issue=source_date_problem(title,summary,link,known_date,utcnow())
+                                if issue:
+                                    con.execute("UPDATE posts SET ai_status='rejected',ai_text_hash='',ai_reason=? WHERE id=?",(issue,old['id']))
                             if stats is not None: stats['duplicates']+=1
                             continue
                         reason=None
                         if not matches_topic(title,summary,channel['topic']): reason='Материал не соответствует тематике канала'
                         elif not interesting(title,summary,channel): reason='Не соответствует фильтрам канала'
-                        elif published and utcnow()-datetime.fromisoformat(published)>timedelta(hours=48): reason='Новость старше 48 часов'
+                        else: reason=source_date_problem(title,summary,link,published,utcnow()) or None
                         state='rejected' if reason else 'pending'
                         cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,image_urls,source_summary,source_published_at,ai_status,ai_reason,ai_score,editorial_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                             (channel_id,title,title+'\n\n'+summary[:900],link,fingerprint,feed_image(entry),json.dumps(feed_images(entry)),summary,published,state,reason or 'Ожидает проверки редактором',0 if reason else None,NEWS_REVISION))
@@ -345,7 +353,8 @@ def automation_ready(channel, now):
 def auto_candidate(row,channel,now):
     if not matches_topic(row['title'] or '',row['source_summary'] or '',channel['topic']): return False
     if row['editorial_revision']!=NEWS_REVISION or not row['news_event'] or not row['news_evidence']: return False
-    if not row['source_published_at']: return False
+    if source_date_problem(row['title'] or '',row['source_summary'] or '',row['url'] or '',row['source_published_at'],now): return False
+    if copy_date_problem(row['text'],row['title'] or '',row['source_summary'] or ''): return False
     if datetime.fromisoformat(row['source_published_at'])>now+timedelta(minutes=15): return False
     if row['ai_status']!='approved' or row['ai_score'] is None or row['ai_score']<channel['min_score']: return False
     if not interesting(row['title'] or '',row['source_summary'] or row['text'],channel): return False
@@ -377,6 +386,8 @@ async def _publish(post_id, automatic=False):
         if not row: raise ValueError('Пост не найден')
         channel=con.execute('SELECT * FROM channels WHERE id=?',(row['channel_id'],)).fetchone()
     if row['status']!='draft': raise ValueError('Пост уже отправлен или требует сверки с MAX')
+    date_issue=source_date_problem(row['title'] or '',row['source_summary'] or '',row['url'] or '',row['source_published_at'],now) or copy_date_problem(row['text'],row['title'] or '',row['source_summary'] or '')
+    if date_issue: raise ValueError(date_issue)
     if not TOKEN or not channel['chat_id']: raise ValueError('Не настроены MAX_TOKEN или Chat ID')
     if automatic and not channel['enabled']: raise ValueError('Автопостинг канала отключён')
     if row['text'].startswith('⚠️ Требуется обработка ИИ'): raise ValueError('Сначала обработайте черновик через Ollama')
@@ -691,7 +702,7 @@ async def publish_now(pid:int):
         if REVIEW_TASK and not REVIEW_TASK.done(): await asyncio.shield(REVIEW_TASK)
         with db() as con: row=con.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
         if not row: raise HTTPException(404,'Пост не найден')
-        if row['status']=='draft' and (row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or not validate_copy(clean_post(row['text']))):
+        if row['status']=='draft' and (row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or not validate_copy(clean_post(row['text'])) or copy_date_problem(row['text'],row['title'] or '',row['source_summary'] or '')):
             await rewrite_post(pid)
         return await publish(pid)
     except HTTPException: raise
@@ -728,10 +739,13 @@ async def rewrite_post(pid:int):
         channel=con.execute('SELECT * FROM channels WHERE id=?',(row['channel_id'],)).fetchone()
     context=row['source_summary'] or row['text'].replace('⚠️ Требуется обработка ИИ перед публикацией.','').strip()
     try:
-        if not interesting(row['title'] or '',context,channel):
+        date_issue=source_date_problem(row['title'] or '',context,row['url'] or '',row['source_published_at'],utcnow())
+        if date_issue:
+            verdict=Verdict(publishable=False,score=0,reason=date_issue,text='')
+        elif not interesting(row['title'] or '',context,channel):
             verdict=Verdict(publishable=False,score=0,reason='Не соответствует ключевым словам или исключающим фильтрам канала',text='')
         else:
-            verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None,topic=channel['topic'],draft_headline=row['headline'])
+            verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None,topic=channel['topic'],draft_headline=row['headline'],published_at=row['source_published_at'],reference_time=utcnow())
     except EditorialUnavailable as exc:
         with db() as con:
             con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',ai_reason=?,review_attempts=review_attempts+1,review_kind=?,review_after=? WHERE id=? AND status='draft'",
