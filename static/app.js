@@ -69,13 +69,13 @@ document.addEventListener('click',event=>{
  action(async()=>{
   const data=await api('/api/max/chats');
   const box=$('maxChatChoices');box.replaceChildren();
-  if(!data.chats.length)box.textContent='Бот не видит каналов. Добавьте его администратором в MAX.';
+  const note=document.createElement('p');note.textContent=[...(data.warnings||[]),data.hint].filter(Boolean).join(' ');box.append(note);
   for(const chat of data.chats){
    const button=document.createElement('button');button.type='button';button.className='button secondary';
    button.textContent=chat.title+' · '+chat.chat_id;
    button.onclick=()=>{$('channelForm').elements.chat_id.value=chat.chat_id;box.replaceChildren()};
    box.append(button);
   }
-  if(data.marker){const note=document.createElement('p');note.textContent='Показаны первые 100 чатов бота. Остальные Chat ID доступны через API MAX с пагинацией.';box.append(note)}
+
  },event.target);
 });

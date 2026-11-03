@@ -645,10 +645,65 @@ def test_discover_max_chat_ids(client,monkeypatch):
     requests=[]
     def handler(request):
         requests.append(request)
-        return httpx.Response(200,json={'chats':[{'chat_id':-123,'title':'TechPulse','link':'https://max.ru/channel_TechPulse'}]})
+        if request.url.path=='/updates':
+            return httpx.Response(200,json={'updates':[
+                {'update_type':'bot_added','chat_id':-123,'is_channel':True},
+                {'update_type':'message_created','message':{'recipient':{'chat_id':-456}}},
+                {'update_type':'bot_started','chat_id':789},
+                {'update_type':'bot_removed','chat_id':-999},
+            ],'marker':42})
+        if request.url.path=='/chats/-999':return httpx.Response(403)
+        cid=int(request.url.path.rsplit('/',1)[1])
+        return httpx.Response(200,json={'chat_id':cid,'type':'dialog' if cid==789 else 'channel','status':'active',
+                                      'title':'TechPulse','link':'https://max.ru/channel_TechPulse'})
     monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
     result=client.get('/api/max/chats')
-    assert result.status_code==200 and result.json()['chats'][0]['chat_id']=='-123'
-    assert requests[0].method=='GET'
+    assert result.status_code==200
+    assert {c['chat_id'] for c in result.json()['chats']}=={'-123','-456'}
+    assert all(r.method=='GET' and r.url.path!='/chats' for r in requests)
+    assert 'marker' not in requests[0].url.params
+    assert requests[0].url.params['timeout']=='0'
+    # Cached discovery survives loss of the original events, and is scoped to the token.
+    def no_updates(request):
+        if request.url.path=='/updates':return httpx.Response(200,json={'updates':[]})
+        return handler(request)
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(no_updates),**kw))
+    assert len(client.get('/api/max/chats').json()['chats'])==2
+    monkeypatch.setattr(module,'TOKEN','another-token')
+    assert client.get('/api/max/chats').json()['chats']==[]
     monkeypatch.setattr(module,'TOKEN','')
     assert client.get('/api/max/chats').status_code==400
+
+
+@pytest.mark.parametrize('status,expected',[(401,'токен'),(403,'запретил'),(404,'не означает неверный токен'),(409,'другой сервис'),(429,'Лимит'),(500,'HTTP 500')])
+def test_max_chat_errors_explain_status_without_leaking_body(client,monkeypatch,status,expected):
+    def handler(request):
+        return httpx.Response(status,json={'code':'method.not.found','message':'secret-value-do-not-show'})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    result=client.get('/api/max/chats')
+    assert result.status_code==502 and expected in result.json()['detail']
+    assert 'secret-value' not in result.text
+
+
+def test_max_empty_updates_and_authentication(client,monkeypatch):
+    requests=[]
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200,json={'updates':[],'marker':42})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    assert client.get('/api/max/chats',headers={'Authorization':''}).status_code==401
+    assert not requests
+    result=client.get('/api/max/chats')
+    assert result.status_code==200 and result.json()['chats']==[]
+    assert 'вручную' in result.json()['hint']
+
+
+def test_max_chat_discovery_connection_and_invalid_response(client,monkeypatch):
+    def offline(request): raise httpx.ConnectError('secret-value',request=request)
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(offline),**kw))
+    result=client.get('/api/max/chats')
+    assert result.status_code==502 and 'соединение' in result.json()['detail']
+    assert 'secret-value' not in result.text
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'unexpected':True})),**kw))
+    result=client.get('/api/max/chats')
+    assert result.status_code==502 and 'формат' in result.json()['detail']

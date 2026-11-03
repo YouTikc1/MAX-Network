@@ -490,17 +490,61 @@ app.mount('/static',StaticFiles(directory=Path(__file__).with_name('static')),na
 def home(_=Depends(auth)):
     return Path(__file__).with_name('templates').joinpath('index.html').read_text(encoding='utf-8')
 
+def max_api_failure(response):
+    status=response.status_code
+    if status==401: return 'MAX отклонил токен (HTTP 401). Проверьте MAX_TOKEN и перезапустите сервер.'
+    if status==403: return 'MAX запретил этот запрос (HTTP 403). Проверьте доступ бота к API.'
+    if status==404: return 'Этот метод или чат недоступен в MAX (HTTP 404). Это не означает неверный токен.'
+    if status==409: return 'MAX отклонил чтение событий (HTTP 409). Проверьте, не использует ли другой сервис события этого бота.'
+    if status==429: return 'Лимит запросов MAX (HTTP 429). Повторите позже.'
+    return f'MAX вернул HTTP {status}. Повторите позже.'
+
+
 @app.get('/api/max/chats',dependencies=[Depends(auth)])
 async def max_chats():
-    if not TOKEN: raise HTTPException(400,'Сначала настройте MAX_TOKEN в окружении сервера и добавьте бота в каналы администратором')
+    if not TOKEN: raise HTTPException(400,'Сначала настройте MAX_TOKEN в окружении сервера и перезапустите сервер')
+    # /chats list is no longer supported. Read a single pending event batch without
+    # advancing its marker, changing webhook subscriptions or acknowledging events.
+    cache_key='max_discovered_chats:'+hashlib.sha256(TOKEN.encode()).hexdigest()
+    with db() as con:
+        cached=con.execute('SELECT value FROM settings WHERE key=?',(cache_key,)).fetchone()
+        known={row['chat_id'] for row in con.execute("SELECT chat_id FROM channels WHERE chat_id!=''")}
+    if cached: known.update(json.loads(cached['value']))
+    warnings=[]
+    chats=[]
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response=await client.get(API+'/chats',headers={'Authorization':TOKEN},params={'count':100})
-            response.raise_for_status()
-            data=response.json()
-        return {'chats':[{'chat_id':str(chat['chat_id']),'title':chat.get('title',''),'link':chat.get('link','')} for chat in data.get('chats',[])], 'marker':data.get('marker')}
-    except (httpx.HTTPError,ValueError,KeyError):
-        raise HTTPException(502,'Не удалось получить каналы MAX. Проверьте токен и доступ бота.')
+            response=await client.get(API+'/updates',headers={'Authorization':TOKEN},params={'limit':100,'timeout':0})
+            if response.is_error:
+                if not known: raise HTTPException(502,max_api_failure(response))
+                warnings.append(max_api_failure(response))
+            else:
+                data=response.json()
+                if not isinstance(data,dict) or not isinstance(data.get('updates'),list): raise ValueError('Invalid updates')
+                for update in data['updates']:
+                    if not isinstance(update,dict): continue
+                    cid=update.get('chat_id')
+                    if cid is None:
+                        message=update.get('message')
+                        recipient=message.get('recipient') if isinstance(message,dict) else None
+                        if isinstance(recipient,dict): cid=recipient.get('chat_id')
+                    if isinstance(cid,int) and not isinstance(cid,bool): known.add(str(cid))
+            for cid in sorted(known):
+                if not re.fullmatch(r'-?\d+',cid): continue
+                response=await client.get(API+'/chats/'+cid,headers={'Authorization':TOKEN})
+                if response.status_code in (403,404): continue
+                if response.is_error: raise HTTPException(502,max_api_failure(response))
+                chat=response.json()
+                if chat.get('type')!='channel' or chat.get('status')!='active': continue
+                if str(chat.get('chat_id'))!=cid: raise ValueError('Invalid chat ID')
+                chats.append({'chat_id':cid,'title':chat.get('title') or 'Канал '+cid,'link':chat.get('link') or ''})
+    except httpx.TransportError:
+        raise HTTPException(502,'Не удалось подключиться к MAX. Проверьте соединение сервера с platform-api.max.ru.')
+    except (ValueError,KeyError,TypeError):
+        raise HTTPException(502,'MAX вернул неожиданный формат данных. Токен менять не требуется.')
+    with db() as con:
+        con.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',(cache_key,json.dumps([chat['chat_id'] for chat in chats])))
+    return {'chats':chats,'warnings':warnings,'hint':'Каналы определяются по доступным событиям бота, а не полному списку. Если нужного канала нет, опубликуйте в нём короткое сообщение вручную в MAX и повторите поиск. Если события получает другой сервис или настроен webhook, возьмите Chat ID из его событий. Бот должен получать события канала.'}
 
 @app.get('/api/channels',dependencies=[Depends(auth)])
 def channels():
