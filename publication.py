@@ -1,6 +1,6 @@
 """MAX HTML rendering. Preserve full text; split before transport limits, not by truncation."""
 import html
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, parse_qsl
 
 MAX_MESSAGE_UNITS=4000
 PRIMARY_CHANNEL_URL='https://max.ru/channel_neuropulse'
@@ -27,7 +27,31 @@ def footer(channel_url,label):
     return '\n\n<a href="'+html.escape(channel_url,quote=True)+'"><b>'+html.escape(label,quote=False)+'</b></a>'
 
 
-def message_payloads(text,channel_url='',label='',image_url='',image_urls=None,headline=None):
+def image_identity(url):
+    """Compare resize variants without rewriting signed download URLs."""
+    parts=urlsplit(url)
+    transforms={'w','h','width','height','q','quality','resize','fit','dpr','format','auto'}
+    query=tuple(sorted((k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True)
+                       if k.lower() not in transforms and not k.lower().startswith('utm_')))
+    return parts.scheme.lower(),parts.netloc.lower(),parts.path,query
+
+
+def selected_images(image_url,image_urls=None,gallery=False):
+    # Automatic news gets one lead image. RSS thumbnails and full-size copies
+    # cannot reliably be distinguished by URL alone; albums require explicit choice.
+    result=[]
+    seen=set()
+    for url in ([image_url] if image_url else [])+list(image_urls or []):
+        if not url: continue
+        key=image_identity(url)
+        if key in seen: continue
+        seen.add(key)
+        result.append(url)
+        if not gallery or len(result)>=10: break
+    return result
+
+
+def message_payloads(text,channel_url='',label='',image_url='',image_urls=None,headline=None,gallery=False):
     # Generated copy has a distinct first paragraph for the headline.
     first, separator, body = text.partition('\n\n')
     # Explicit metadata from the editor wins; never turn a body paragraph into a title.
@@ -65,7 +89,7 @@ def message_payloads(text,channel_url='',label='',image_url='',image_urls=None,h
     if not chunks:raise ValueError('Текст новости пустой')
     chunks[-1]+=signature
     result=[{'text':chunk,'format':'html'} for chunk in chunks]
-    images=list(dict.fromkeys(([image_url] if image_url else [])+list(image_urls or [])))[:10]
+    images=selected_images(image_url,image_urls,gallery=gallery)
     if images:result[0]['attachments']=[{'type':'image','payload':{'url':url}} for url in images]
     assert all(units(part['text'])<=MAX_MESSAGE_UNITS for part in result)
     return result

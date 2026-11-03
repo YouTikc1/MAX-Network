@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import calendar
 import json
 from topics import PROFILES, CHANNEL_URLS, brief_for, matches_topic
-from publication import message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
+from publication import selected_images, message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -77,6 +77,7 @@ def init():
         post_fields = {
             'headline':"TEXT NOT NULL DEFAULT ''",
             'image_urls':"TEXT NOT NULL DEFAULT '[]'",
+            'media_mode':"TEXT NOT NULL DEFAULT 'single'",
             'ai_status': "TEXT NOT NULL DEFAULT 'pending'", 'ai_score': 'INTEGER',
             'ai_reason': "TEXT NOT NULL DEFAULT 'Ещё не проверено редактором'",
             'ai_text_hash': "TEXT NOT NULL DEFAULT ''", 'source_summary': "TEXT NOT NULL DEFAULT ''",
@@ -198,23 +199,29 @@ def safe_image_url(url):
     return str(url).strip()[:2048]
 
 def feed_images(entry):
-    candidates=[]
-    for item in entry.get('media_content',[]) + entry.get('media_thumbnail',[]):
-        if isinstance(item,dict): candidates.append(item.get('url',''))
+    full=[]
+    thumbnails=[]
+    for item in entry.get('media_content',[]):
+        if isinstance(item,dict) and (not item.get('type') or str(item['type']).startswith('image/')):
+            full.append(item.get('url',''))
     for item in entry.get('enclosures',[]):
-        if str(item.get('type','')).startswith('image/'): candidates.append(item.get('href',''))
+        if str(item.get('type','')).startswith('image/'): full.append(item.get('href',''))
+    for item in entry.get('media_thumbnail',[]):
+        if isinstance(item,dict): thumbnails.append(item.get('url',''))
     for key in ('image','thumbnail'):
-        v=entry.get(key)
-        if isinstance(v,dict): candidates.append(v.get('href') or v.get('url'))
-        elif isinstance(v,str): candidates.append(v)
-    # RSS feeds sometimes embed the lead image in the HTML summary/content.
-    for block in [entry.get('summary', '')] + [x.get('value', '') for x in entry.get('content', []) if isinstance(x, dict)]:
-        candidates.extend(html.unescape(m.group(1)) for m in re.finditer(r'<img\b[^>]*?\bsrc=[\"\']([^\"\']+)', block, re.I))
-    images=[]
-    for url in candidates:
-        checked=safe_image_url(urljoin(entry.get('link', ''), str(url or '')))
-        if checked and checked not in images: images.append(checked)
-    return images[:10]
+        value=entry.get(key)
+        url=(value.get('href') or value.get('url')) if isinstance(value,dict) else value
+        if isinstance(url,str): (full if key=='image' else thumbnails).append(url)
+    embedded=[]
+    for block in [entry.get('summary','')]+[x.get('value','') for x in entry.get('content',[]) if isinstance(x,dict)]:
+        embedded.extend(html.unescape(m.group(1)) for m in re.finditer(r'<img\b[^>]*?\bsrc=[\"\']([^\"\']+)',block,re.I))
+    # Prefer full-size metadata, then article images, then thumbnails. Do not
+    # merge parallel representations of the same article illustration.
+    for group in (full,embedded,thumbnails):
+        urls=[safe_image_url(urljoin(entry.get('link',''),str(url or ''))) for url in group]
+        images=selected_images('',[url for url in urls if url],gallery=True)
+        if images: return images
+    return []
 
 def feed_image(entry):
     return next(iter(feed_images(entry)), '')
@@ -370,7 +377,7 @@ async def _publish(post_id, automatic=False):
         raise ValueError('Текст содержит инструкции, пересказ статьи или некорректный формат. Редактор подготовит новую версию.')
     if row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or row['ai_text_hash']!=text_hash(row['text']) or not row['news_event'] or not row['news_evidence']:
         raise ValueError('Редактор ещё проверяет новость. Непроверенный текст отправлен не будет.')
-    payloads=message_payloads(clean_post(row['text']),channel['channel_url'],channel['signature_text'] or channel['name'],row['image_url'] or '',json.loads(row['image_urls']) if row['image_url'] else [],headline=row['headline'])
+    payloads=message_payloads(clean_post(row['text']),channel['channel_url'],channel['signature_text'] or channel['name'],row['image_url'] or '',json.loads(row['image_urls']) if row['image_url'] else [],headline=row['headline'],gallery=row['media_mode']=='gallery')
     with db() as con:
         # Durable claim prevents retries after a restart or another worker.
         cur=con.execute("UPDATE posts SET status='publishing',remote_ids='[]',remote_id=NULL,publish_mode=?,published_chat_id=? WHERE id=? AND status='draft'",
@@ -658,10 +665,12 @@ async def edit_post(pid:int,item:dict):
         images=item.get('image_urls',json.loads(row['image_urls']) if image_url==row['image_url'] else [])
         if not isinstance(images,list) or len(images)>10 or any(not isinstance(url,str) or not safe_image_url(url) for url in images):
             raise HTTPException(400,'Укажите не более 10 публичных HTTPS URL изображений')
+        media_mode=item.get('media_mode',row['media_mode'])
+        if media_mode not in ('single','gallery'): raise HTTPException(400,'Неизвестный режим изображений')
         if not image_url: images=[]
         changed=value!=row['text']
-        con.execute("UPDATE posts SET text=?,image_url=?,image_urls=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,user_edited=?,error=NULL WHERE id=?",
-            (value,image_url,json.dumps(images),approved,'pending' if changed else row['ai_status'],'' if changed else row['ai_text_hash'],
+        con.execute("UPDATE posts SET text=?,image_url=?,image_urls=?,media_mode=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,user_edited=?,error=NULL WHERE id=?",
+            (value,image_url,json.dumps(images),media_mode,approved,'pending' if changed else row['ai_status'],'' if changed else row['ai_text_hash'],
              'Текст проверяется редактором автоматически' if changed else row['ai_reason'],int(changed or row['user_edited']),pid))
     if changed: queue_review()
     return {'ok':True}

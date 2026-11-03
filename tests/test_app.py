@@ -634,7 +634,7 @@ def test_wrong_topic_blocked_even_with_approved_copy(client,monkeypatch):
 def test_headline_escaping_and_multiple_images():
     from publication import message_payloads
     parts=message_payloads('Новый <релиз> & тест\n\nТекст новости', 'https://max.ru/channel_TechPulse','TechPulse',
-        'https://news.example/a.jpg',['https://news.example/a.jpg','https://news.example/b.jpg'])
+        'https://news.example/a.jpg',['https://news.example/a.jpg','https://news.example/b.jpg'],gallery=True)
     assert parts[0]['text'].startswith('<b>Новый &lt;релиз&gt; &amp; тест</b>\n\nТекст новости\n\n<a ')
     assert len(parts[0]['attachments'])==2
 
@@ -845,3 +845,68 @@ def test_old_duplicate_draft_is_rechecked_before_send(client,monkeypatch):
     assert client.post(f'/api/posts/{pid}/publish').status_code==200
     sent=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)['text']
     assert sent.count('Компания выпустила новую модель ИИ')==1
+
+
+
+def test_rss_does_not_merge_full_image_with_thumbnail_or_html_copy():
+    images=module.feed_images({
+        'link':'https://news.example/story',
+        'media_content':[{'url':'https://cdn.example/full.jpg','type':'image/jpeg'}],
+        'media_thumbnail':[{'url':'https://cdn.example/thumb.jpg'}],
+        'summary':'<img src="https://other.example/same-photo.jpg">',
+    })
+    assert images==['https://cdn.example/full.jpg']
+    assert module.feed_images({'media_thumbnail':[{'url':'https://cdn.example/thumb.jpg'}]})==['https://cdn.example/thumb.jpg']
+
+
+def test_rss_invalid_full_size_falls_back_to_article_image():
+    assert module.feed_images({'media_content':[{'url':'http://localhost/internal'}],
+                              'summary':'<img src="https://news.example/photo.jpg">'})==['https://news.example/photo.jpg']
+
+
+def test_gallery_deduplicates_resize_variants_without_rewriting_urls():
+    from publication import selected_images
+    signed='https://cdn.example/photo.jpg?width=1200&token=abc'
+    assert selected_images(signed,[
+        'https://cdn.example/photo.jpg?width=320&token=abc#preview',
+        'https://cdn.example/photo.jpg?token=abc&height=200&utm_source=rss',
+        'https://cdn.example/photo.jpg?id=2&token=abc',
+    ],gallery=True)==[signed,'https://cdn.example/photo.jpg?id=2&token=abc']
+
+
+@pytest.mark.parametrize('automatic',[False,True])
+def test_old_queued_images_send_only_one_by_default(client,monkeypatch,automatic):
+    configure(client,monkeypatch,automatic)
+    calls=network(monkeypatch)
+    pid=post(image_url='https://news.example/large.jpg',image_urls=json.dumps([
+        'https://news.example/large.jpg','https://other.example/same-image-small.jpg']))
+    if automatic:asyncio.run(module.automation_tick())
+    else:assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    payload=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)
+    assert payload['attachments']==[{'type':'image','payload':{'url':'https://news.example/large.jpg'}}]
+
+
+def test_gallery_requires_explicit_editor_choice_and_can_be_disabled(client,monkeypatch):
+    configure(client,monkeypatch)
+    calls=network(monkeypatch)
+    urls=['https://news.example/a.jpg','https://news.example/b.jpg']
+    pid=post(image_url=urls[0],image_urls=json.dumps(urls))
+    assert client.put(f'/api/posts/{pid}',json={'text':COPY,'image_url':urls[0],'media_mode':'gallery'}).status_code==200
+    with module.db() as con:
+        saved=con.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+        assert saved['media_mode']=='gallery' and saved['ai_status']=='approved'
+    # Old clients omitting the new field preserve the user's explicit setting.
+    assert client.put(f'/api/posts/{pid}',json={'text':COPY,'image_url':urls[0]}).status_code==200
+    assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    payload=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)
+    assert [a['payload']['url'] for a in payload['attachments']]==urls
+    other=post(fingerprint='another',image_url=urls[0],image_urls=json.dumps(urls),media_mode='gallery')
+    assert client.put(f'/api/posts/{other}',json={'text':COPY,'image_url':urls[0],'media_mode':'single'}).status_code==200
+    with module.db() as con:assert con.execute('SELECT media_mode FROM posts WHERE id=?',(other,)).fetchone()[0]=='single'
+    assert client.put(f'/api/posts/{other}',json={'text':COPY,'image_url':urls[0],'media_mode':'unknown'}).status_code==400
+
+
+def test_default_renderer_never_attaches_second_rss_copy():
+    from publication import message_payloads
+    parts=message_payloads(COPY,image_url='https://news.example/a.jpg',image_urls=['https://cdn.example/another-url-for-a.jpg'])
+    assert len(parts[0]['attachments'])==1
