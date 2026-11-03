@@ -44,14 +44,14 @@ def post(**changes):
     values=dict(channel_id=1,title='Компания выпустила новую модель ИИ',text=COPY,url='https://news.example/story',fingerprint='story',
         source_summary=SOURCE,source_published_at=now.isoformat(),reviewed_at=now.isoformat(),ai_status='approved',ai_score=91,
         ai_reason='Свежий релиз модели',ai_text_hash=editorial.text_hash(COPY),editorial_revision=editorial.NEWS_REVISION,
-        news_event='Компания выпустила новую модель ИИ',news_evidence=SOURCE[:60])
+        news_event='Компания выпустила новую модель ИИ',news_evidence=SOURCE[:60],headline=COPY.split('\n\n')[0])
     values.update(changes)
     with module.db() as con:
         cur=con.execute('INSERT INTO posts('+','.join(values)+') VALUES ('+','.join('?' for _ in values)+')',list(values.values()))
         return cur.lastrowid
 
 
-def network(monkeypatch,*,approve=True,score=91,copy=COPY,evidence=None,news=True,failure=None,rss=None,copy_valid=True):
+def network(monkeypatch,*,approve=True,score=91,copy=COPY,evidence=None,news=True,failure=None,rss=None,copy_valid=True,headline=None):
     calls=[]
     def handler(request):
         calls.append(request)
@@ -62,7 +62,9 @@ def network(monkeypatch,*,approve=True,score=91,copy=COPY,evidence=None,news=Tru
                 body=json.loads(payload['prompt'])['article']['body']
                 result={'publishable':approve,'is_news':news,'score':score,'reason':'Свежий релиз модели' if approve else 'Это инструкция, а не новость','event':json.loads(payload['prompt'])['article']['title'] if approve else '', 'is_ai':True, 'support_ids':([0,1] if evidence is None else [999]) if approve else []}
             elif stage=='CopyCheck': result={'valid':copy_valid,'reason':'Факты подтверждены материалом' if copy_valid else 'В тексте есть неподтверждённые характеристики'}
-            else: result={'text':copy}
+            else:
+                head=COPY.split('\n\n')[0] if headline is None and copy==COPY else (headline or '')
+                result={'headline':head,'text':copy[len(head)+2:] if head and copy.startswith(head+'\n\n') else copy}
             return httpx.Response(200,json={'response':json.dumps(result,ensure_ascii=False)})
         if request.url.host=='news.example': return httpx.Response(200,text=rss or '<rss version="2.0"><channel><title>Empty</title></channel></rss>')
         if failure=='timeout': raise httpx.ReadTimeout('timeout',request=request)
@@ -246,7 +248,8 @@ def test_schedule_constraints(client,monkeypatch,constraint):
     if constraint in ('limit','interval','duplicate'):
         post(fingerprint='sent',url='https://news.example/other',title='Компания выпустила новую модель ИИ' if constraint=='duplicate' else 'Иная новость',status='published',published_at=(now-timedelta(minutes=60 if constraint=='duplicate' else 1)).isoformat())
     calls=network(monkeypatch);asyncio.run(module.automation_tick())
-    assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+    sends=[r for r in calls if r.url.host=='platform-api.max.ru']
+    assert len(sends)==(1 if constraint in ('future','hours','limit','interval') else 0)
 
 @pytest.mark.parametrize('failure',['timeout','400','500','missing_mid'])
 def test_publish_error_durable_pause_and_no_retry(client,monkeypatch,failure):
@@ -493,11 +496,15 @@ def test_primary_signature_is_correct_and_preserved_by_old_clients(client):
     assert client.put('/api/channels/1',json={'name':'N','channel_url':'javascript:alert(1)'}).status_code==400
 
 
+def long_copy(count):
+    return '\n\n'.join(f'Испытание №{i}: система обработала {100+i} документов за {20+i} секунд. В наборе было {30+i} изображений; доступ открыли для {200+i} участников.' for i in range(count))
+
+
 def test_new_post_longer_than_750_is_kept(client,monkeypatch):
-    long_copy='\n\n'.join(COPY.replace('Компания',f'Компания Product{i}') for i in range(8))
-    network(monkeypatch,copy=long_copy)
+    long_text=long_copy(8)
+    network(monkeypatch,copy=long_text)
     result=asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
-    assert len(result.text)>750 and result.text==long_copy
+    assert len(result.text)>750 and result.text==long_text
 
 
 def test_html_payloads_keep_all_characters_and_put_link_after_news():
@@ -526,7 +533,7 @@ def test_signature_text_is_html_escaped():
 def test_long_publish_sends_all_parts_and_records_ids(client,monkeypatch):
     from publication import message_payloads
     configure(client,monkeypatch)
-    long_text='\n\n'.join(COPY.replace('Компания',f'Компания Product{i}') for i in range(40))
+    long_text=long_copy(40)
     pid=post(text=long_text,ai_text_hash=editorial.text_hash(long_text),image_url='https://news.example/photo.jpg')
     calls=[]
     def handler(request):
@@ -547,7 +554,7 @@ def test_long_publish_sends_all_parts_and_records_ids(client,monkeypatch):
 
 def test_partial_long_post_failure_cannot_be_automatically_repeated(client,monkeypatch):
     configure(client,monkeypatch,True)
-    long_text='\n\n'.join(COPY for _ in range(30))
+    long_text=long_copy(60)
     pid=post(text=long_text,ai_text_hash=editorial.text_hash(long_text))
     calls=[]
     def handler(request):
@@ -570,7 +577,7 @@ def test_generation_token_limit_retries_instead_of_publishing_cut_text(client):
     calls=[]
     def handler(request):
         calls.append(json.loads(request.content))
-        return httpx.Response(200,json={'response':json.dumps({'text':long_copy}),'done_reason':'length' if len(calls)==1 else 'stop'})
+        return httpx.Response(200,json={'response':json.dumps({'headline':'','text':long_copy}),'done_reason':'length' if len(calls)==1 else 'stop'})
     async def run():
         async with CLIENT(transport=httpx.MockTransport(handler)) as c:
             return await editorial.generate(c,'write',{'source':SOURCE},editorial.PostCopy)
@@ -707,3 +714,134 @@ def test_max_chat_discovery_connection_and_invalid_response(client,monkeypatch):
     monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'unexpected':True})),**kw))
     result=client.get('/api/max/chats')
     assert result.status_code==502 and 'формат' in result.json()['detail']
+
+
+def test_instant_pipeline_publishes_each_approval_without_reserve_or_cap(client,monkeypatch):
+    configure(client,monkeypatch,True)
+    calls=network(monkeypatch,rss=pool_feed(25))
+    client.post('/api/sources',json={'channel_id':1,'url':'https://news.example/rss'})
+    asyncio.run(module.run_collection())
+    sends=[i for i,r in enumerate(calls) if r.url.host=='platform-api.max.ru']
+    generations=[i for i,r in enumerate(calls) if r.url.path=='/api/generate']
+    assert len(sends)==25
+    assert sends[0]<generations[3]  # First post is sent before the next story's inference.
+    with module.db() as con:
+        assert con.execute("SELECT COUNT(*) FROM posts WHERE status='published'").fetchone()[0]==25
+        assert con.execute("SELECT COUNT(*) FROM posts WHERE ai_status='standby'").fetchone()[0]==0
+    asyncio.run(module.automation_tick())
+    assert len([r for r in calls if r.url.host=='platform-api.max.ru'])==25
+
+
+def test_prepared_batch_drains_newest_first_without_cooldown(client,monkeypatch):
+    configure(client,monkeypatch,True)
+    now=datetime.now(timezone.utc)
+    for i in range(4):
+        post(title=f'Компания выпустила модель ИИ версии {i}',fingerprint=str(i),url=f'https://news.example/{i}',source_published_at=(now-timedelta(minutes=i)).isoformat())
+    sends=[]
+    def handler(request):
+        with module.db() as con:
+            sends.append(con.execute("SELECT title FROM posts WHERE status='publishing'").fetchone()[0])
+        return httpx.Response(200,json={'message':{'body':{'mid':str(len(sends))}}})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    asyncio.run(module.automation_tick())
+    assert len(sends)==4
+    assert [title[-1] for title in sends]==['0','1','2','3']
+
+
+def test_new_arrivals_take_priority_during_inference(client,monkeypatch):
+    configure(client,monkeypatch,True)
+    network(monkeypatch)
+    now=datetime.now(timezone.utc)
+    first=post(title='ИИ модель версии 1',fingerprint='1',url='https://news.example/1',ai_status='pending')
+    post(title='ИИ модель версии 2',fingerprint='2',url='https://news.example/2',ai_status='pending',source_published_at=(now-timedelta(hours=1)).isoformat())
+    order=[]
+    async def fake_review(title,*args,**kwargs):
+        order.append(title)
+        if len(order)==1:
+            post(title='ИИ модель версии 3',fingerprint='3',url='https://news.example/3',ai_status='pending',source_published_at=(now+timedelta(minutes=1)).isoformat())
+        else:
+            with module.db() as con: assert con.execute('SELECT status FROM posts WHERE id=?',(first,)).fetchone()[0]=='published'
+        return editorial.Verdict(publishable=True,score=90,reason='Подтверждено',text=COPY,event=title,evidence=SOURCE,headline=COPY.split('\n\n')[0])
+    monkeypatch.setattr(module,'review',fake_review)
+    asyncio.run(module.review_pending())
+    assert order==['ИИ модель версии 1','ИИ модель версии 3','ИИ модель версии 2']
+
+
+def test_feed_poll_continues_while_model_is_busy(client,monkeypatch):
+    called=[]
+    async def collect(**kwargs):
+        called.append(kwargs)
+        module.COLLECT_STATE['running']=False
+    monkeypatch.setattr(module,'run_collection',collect)
+    module.REVIEW_STATE['running']=True
+    asyncio.run(module.tick())
+    assert called==[{'review_after':False}]
+
+
+@pytest.mark.parametrize('headline',['','Новая модель для документов'])
+def test_model_explicitly_chooses_headline_and_publication_respects_it(client,monkeypatch,headline):
+    body='Разработчики открыли доступ к системе обработки документов. Испытания прошли на русском языке.'
+    calls=network(monkeypatch,copy=body,headline=headline)
+    configure(client,monkeypatch)
+    pid=post(ai_status='pending')
+    assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    saved=next(p for p in client.get('/api/posts').json() if p['id']==pid)
+    assert saved['headline']==headline
+    sent=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)['text']
+    assert sent.startswith('<b>'+headline+'</b>\n\n'+body if headline else body+'\n\n<a ')
+    assert sent.count(body)==1
+
+
+@pytest.mark.parametrize("body",["OpenAI открыла доступ к новой модели для всех пользователей.","ЦБ снизил ставку до 15%."])
+def test_short_copy_without_title_or_padding_is_accepted(client,monkeypatch,body):
+    network(monkeypatch,copy=body,headline='')
+    result=asyncio.run(editorial.review('OpenAI открыла новую модель',SOURCE,'ИИ'))
+    assert result.publishable and result.text==body and result.headline==''
+
+
+@pytest.mark.parametrize('copy',[
+    'Какие шансы у России на ближайших турнирах по хоккею?\n\nПрогноз на ЧМ-2027: минимум финал.\n\nКакие шансы у России на ближайших турнирах по хоккею?\n\nПрогноз на ЧМ-2027: минимум финал.',
+    COPY+'\n\n'+COPY,
+    'Компания открыла доступ к новой модели для всех пользователей. Компания открыла доступ к новой модели для всех пользователей.',
+    'MoneyPulse | Финансы\n'+COPY,
+])
+def test_repeated_or_channel_prefixed_generation_never_approved(client,monkeypatch,copy):
+    calls=network(monkeypatch,copy=copy,headline='')
+    with pytest.raises(editorial.EditorialUnavailable):asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
+    assert len([r for r in calls if r.url.path=='/api/generate'])==3
+    assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+
+
+def test_duplicate_headline_body_gets_a_corrected_attempt(client,monkeypatch):
+    bodies=iter([
+        {'headline':'OpenAI открыла доступ к новой модели для всех пользователей','text':'OpenAI открыла доступ к новой модели для всех пользователей. Модель обрабатывает документы и изображения.'},
+        {'headline':'','text':'OpenAI открыла доступ к новой модели для всех пользователей. Она обрабатывает документы и изображения.'},
+    ])
+    original=editorial.generate
+    async def generate(client,system,data,schema):
+        if schema is editorial.PostCopy:return editorial.PostCopy(**next(bodies))
+        return await original(client,system,data,schema)
+    network(monkeypatch)
+    monkeypatch.setattr(editorial,'generate',generate)
+    verdict=asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
+    assert verdict.publishable and verdict.headline=='' and verdict.text.count('OpenAI')==1
+
+
+def test_plain_multi_paragraph_post_is_not_automatically_bold():
+    from publication import message_payloads
+    text='Компания выпустила новую модель.\n\nДоступ открыли всем пользователям.'
+    assert not message_payloads(text,headline='')[0]['text'].startswith('<b>')
+
+
+def test_model_detected_semantic_repetition_is_not_approved(client,monkeypatch):
+    network(monkeypatch,copy=COPY,copy_valid=False)
+    with pytest.raises(editorial.EditorialUnavailable):asyncio.run(editorial.review('OpenAI выпустила модель',SOURCE,'ИИ'))
+
+
+def test_old_duplicate_draft_is_rechecked_before_send(client,monkeypatch):
+    configure(client,monkeypatch)
+    pid=post(text=COPY+'\n\n'+COPY,editorial_revision=module.NEWS_REVISION-1)
+    calls=network(monkeypatch)
+    assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    sent=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)['text']
+    assert sent.count('Компания выпустила новую модель ИИ')==1

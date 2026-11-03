@@ -27,10 +27,12 @@ def footer(channel_url,label):
     return '\n\n<a href="'+html.escape(channel_url,quote=True)+'"><b>'+html.escape(label,quote=False)+'</b></a>'
 
 
-def message_payloads(text,channel_url='',label='',image_url='',image_urls=None):
+def message_payloads(text,channel_url='',label='',image_url='',image_urls=None,headline=None):
     # Generated copy has a distinct first paragraph for the headline.
-    headline, separator, body = text.partition('\n\n')
-    has_headline = bool(separator and len(headline)<=300 and '\n' not in headline)
+    first, separator, body = text.partition('\n\n')
+    # Explicit metadata from the editor wins; never turn a body paragraph into a title.
+    if headline is None: headline=first if separator and len(first)<=300 and '\n' not in first else ''
+    has_headline=bool(headline and separator and first==headline)
     def render(value, offset):
         escaped=html.escape(value,quote=False)
         if has_headline and offset<len(headline):
