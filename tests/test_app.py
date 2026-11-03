@@ -102,7 +102,7 @@ def test_auth_ui_and_sources_crud(client):
     payload={'channel_id':cid,'url':'https://news.example/rss'}
     assert client.post('/api/sources',json=payload).status_code==200
     assert client.post('/api/sources',json=payload).status_code==409
-    sid=client.get('/api/sources').json()[0]['id']
+    sid=next(source['id'] for source in client.get('/api/sources').json() if source['channel_id']==cid)
     assert client.delete(f'/api/channels/{cid}').status_code==409
     assert client.delete(f'/api/sources/{sid}').status_code==200
     assert client.delete(f'/api/channels/{cid}').status_code==200
@@ -324,7 +324,7 @@ def test_source_date_backfill_and_news_feed_preserve_data(client,monkeypatch):
     saved=client.get('/api/posts').json()[0]
     assert saved['id']==pid and saved['text']==COPY and saved['source_published_at']
     BOOTSTRAP(1);BOOTSTRAP(1)
-    sources=client.get('/api/sources').json()
+    sources=[source for source in client.get('/api/sources').json() if source['channel_id']==1]
     assert len(sources)==1+len(module.NEWS_FEEDS) and any('/rss/news/' in r['url'] for r in sources)
 
 
@@ -350,7 +350,8 @@ def test_old_schema_migration_preserves_actual_records(client,tmp_path,monkeypat
     with module.db() as con:
         assert con.execute('SELECT COUNT(*) FROM channels').fetchone()[0]==5
         assert con.execute('SELECT name FROM channels').fetchone()[0]=='Мой канал'
-        assert con.execute('SELECT COUNT(*) FROM sources').fetchone()[0]==1
+        assert con.execute('SELECT COUNT(*) FROM sources WHERE channel_id=7').fetchone()[0]==1
+        assert con.execute('SELECT url FROM sources WHERE channel_id=7').fetchone()[0]=='https://news.example/rss'
         row=con.execute('SELECT * FROM posts').fetchone()
         assert row['text']=='Мой сохранённый текст' and row['ai_status']=='pending'
 
@@ -910,3 +911,93 @@ def test_default_renderer_never_attaches_second_rss_copy():
     from publication import message_payloads
     parts=message_payloads(COPY,image_url='https://news.example/a.jpg',image_urls=['https://cdn.example/another-url-for-a.jpg'])
     assert len(parts[0]['attachments'])==1
+
+
+
+def test_economic_profiles_have_multiple_sources_and_lower_stock_threshold(client):
+    from topics import ECONOMIC_FEEDS
+    channels=client.get('/api/channels').json()
+    sources=client.get('/api/sources').json()
+    for channel in channels:
+        if channel['topic'] in ('finance','business'):
+            assert channel['min_score']==65
+            urls={s['url'] for s in sources if s['channel_id']==channel['id']}
+            assert set(ECONOMIC_FEEDS)<=urls and len(urls)==4
+        else:assert channel['min_score']==75
+
+
+def test_economic_migration_preserves_custom_settings_and_requeues_fresh_rejections(client):
+    channels={c['topic']:c for c in client.get('/api/channels').json()}
+    money,biz=channels['finance']['id'],channels['business']['id']
+    fresh=post(channel_id=money,fingerprint='fresh-econ',ai_status='rejected',review_attempts=3,review_after='2099-01-01T00:00:00+00:00')
+    old=post(channel_id=money,fingerprint='old-econ',ai_status='rejected',source_published_at='2020-01-01T00:00:00+00:00')
+    published=post(channel_id=biz,fingerprint='published-econ',status='published')
+    deleted=post(channel_id=money,fingerprint='deleted-econ',status='deleted',ai_status='rejected')
+    with module.db() as con:
+        con.execute("DELETE FROM settings WHERE key='economic_feeds_v1'")
+        con.execute('UPDATE channels SET min_score=75 WHERE id=?',(money,))
+        con.execute('UPDATE channels SET min_score=82 WHERE id=?',(biz,))
+        con.execute('INSERT INTO sources(channel_id,url) VALUES (?,?)',(money,'https://custom.example/economy.rss'))
+    module.init();module.init()
+    with module.db() as con:
+        assert con.execute('SELECT min_score FROM channels WHERE id=?',(money,)).fetchone()[0]==65
+        assert con.execute('SELECT min_score FROM channels WHERE id=?',(biz,)).fetchone()[0]==82
+        assert con.execute('SELECT COUNT(*) FROM sources WHERE channel_id=?',(money,)).fetchone()[0]==5
+        row=con.execute('SELECT * FROM posts WHERE id=?',(fresh,)).fetchone()
+        assert row['ai_status']=='pending' and row['review_after'] is None and row['review_attempts']==0
+        assert con.execute('SELECT ai_status FROM posts WHERE id=?',(old,)).fetchone()[0]=='rejected'
+        assert con.execute('SELECT status FROM posts WHERE id=?',(published,)).fetchone()[0]=='published'
+        assert con.execute('SELECT status FROM posts WHERE id=?',(deleted,)).fetchone()[0]=='deleted'
+
+
+@pytest.mark.parametrize('topic,title',[
+    ('finance','Индекс Мосбиржи вырос на 1,5%'),
+    ('finance','Сбер объявил дивиденды'),
+    ('finance','ВВП вырос на 2,1%'),
+    ('business','Совет директоров одобрил выкуп акций'),
+    ('business','Завод заключил экспортный контракт'),
+])
+def test_economic_candidate_filter_accepts_routine_numeric_news(topic,title):
+    from topics import matches_topic
+    assert matches_topic(title,'',topic)
+
+
+@pytest.mark.parametrize('topic',['finance','business'])
+def test_routine_economic_news_score_68_can_publish(client,monkeypatch,topic):
+    channel=next(c for c in client.get('/api/channels').json() if c['topic']==topic)
+    title='Компания опубликовала отчётность: прибыль выросла на 7,8%'
+    body='Компания сообщила о росте прибыли на 7,8%. Выручка за квартал составила 1 500 млн рублей.'
+    calls=network(monkeypatch,score=68,copy=body,headline='')
+    pid=post(channel_id=channel['id'],title=title,source_summary=body,ai_status='pending')
+    assert client.put('/api/channels/'+str(channel['id']),json={**channel,'chat_id':'-123'}).status_code==200
+    assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    sent=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)['text']
+    assert body in sent and channel['channel_url'] in sent
+    prompts=[json.loads(r.content) for r in calls if r.url.path=='/api/generate']
+    judge=prompts[0]
+    assert '65–74' in judge['system'] and 'отсутствие сенсации' in judge['system']
+    check=next(p for p in prompts if p['format']['title']=='CopyCheck')
+    data=json.loads(check['prompt'])
+    assert '7,8%' in data['article']['body'] and '1 500 млн' in data['article']['body']
+    assert 'Не требуй независимой проверки' in check['system']
+    assert 'Проценты и процентные пункты не равны' in check['system']
+
+
+def test_economic_false_claim_still_blocks_publication(client,monkeypatch):
+    channel=next(c for c in client.get('/api/channels').json() if c['topic']=='finance')
+    source='Банк сообщил, что ставка по вкладу составляет 15% годовых.'
+    calls=network(monkeypatch,score=68,copy='Банк увеличил ставку по вкладу до 25% годовых для всех клиентов.',headline='',copy_valid=False)
+    pid=post(channel_id=channel['id'],title='Банк объявил ставку по вкладу',source_summary=source,ai_status='pending')
+    client.put('/api/channels/'+str(channel['id']),json={**channel,'chat_id':'-123'})
+    assert client.post(f'/api/posts/{pid}/publish').status_code==503
+    assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+
+
+def test_new_economic_channel_defaults_and_omitted_threshold_preservation(client):
+    result=client.post('/api/channels',json={'name':'Финансы','topic':'finance'})
+    assert result.status_code==200
+    cid=result.json()['id']
+    assert next(c for c in client.get('/api/channels').json() if c['id']==cid)['min_score']==65
+    assert client.put(f'/api/channels/{cid}',json={'name':'Финансы','topic':'finance','min_score':80}).status_code==200
+    assert client.put(f'/api/channels/{cid}',json={'name':'Финансы','topic':'finance'}).status_code==200
+    assert next(c for c in client.get('/api/channels').json() if c['id']==cid)['min_score']==80

@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import calendar
 import json
-from topics import PROFILES, CHANNEL_URLS, brief_for, matches_topic
+from topics import PROFILES, CHANNEL_URLS, brief_for, matches_topic, default_min_score
 from publication import selected_images, message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
@@ -125,12 +125,22 @@ def init():
                     if current['name']=='Технологии' or (current['topic']=='ai' and current['editorial_brief']==DEFAULT_EDITORIAL_BRIEF):
                         con.execute('UPDATE channels SET name=?,signature_text=?,topic=?,editorial_brief=? WHERE id=?',(name,name,topic,brief_for(topic),current['id']))
                     continue
-                con.execute('INSERT INTO channels(name,signature_text,topic,editorial_brief) VALUES (?,?,?,?)',(name,name,topic,brief_for(topic)))
+                con.execute('INSERT INTO channels(name,signature_text,topic,editorial_brief,min_score) VALUES (?,?,?,?,?)',(name,name,topic,brief_for(topic),default_min_score(topic)))
             con.execute("INSERT INTO settings VALUES ('pulse_profiles_v1','1')")
         if not con.execute("SELECT 1 FROM settings WHERE key='pulse_links_v1'").fetchone():
             for topic,(name,_,_) in PROFILES.items():
                 con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE (lower(name) LIKE ? OR (id=1 AND name='Нейросети')) AND (channel_url='' OR channel_url=?)",(CHANNEL_URLS[topic],name,name.split(' | ')[0].lower()+'%',PRIMARY_CHANNEL_URL))
             con.execute("INSERT INTO settings VALUES ('pulse_links_v1','1')")
+        if not con.execute("SELECT 1 FROM settings WHERE key='economic_feeds_v1'").fetchone():
+            for channel in con.execute("SELECT id,topic FROM channels WHERE topic IN ('finance','business')").fetchall():
+                cid=channel['id']
+                # Lower only the previous stock threshold; preserve custom scores.
+                con.execute('UPDATE channels SET min_score=? WHERE id=? AND min_score=75',(default_min_score(channel['topic']),cid))
+                con.executemany('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',[(cid,url) for url in PROFILES[channel['topic']][2]])
+                con.execute("UPDATE posts SET ai_status='pending',ai_score=NULL,ai_text_hash='',review_after=NULL,review_attempts=0,review_kind=NULL,ai_reason='Обновлён отбор финансовых и деловых новостей — проверяем повторно' WHERE channel_id=? AND status='draft' AND ai_status='rejected' AND source_published_at>=?",
+                    (cid,(utcnow()-timedelta(hours=48)).isoformat()))
+            con.execute("INSERT INTO settings VALUES ('economic_feeds_v1','1')")
+
 
 
 def auth(authorization: Optional[str] = Header(None)):
@@ -566,8 +576,9 @@ def save_channel(item, cid=None):
         current=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone() if cid else None
         if cid and not current: raise HTTPException(404,'Канал не найден')
         if current:
-            for field in ('channel_url','signature_text','topic'):
+            for field in ('channel_url','signature_text','topic','min_score'):
                 if field not in item.model_fields_set: values[field]=current[field]
+        if not current and 'min_score' not in item.model_fields_set: values['min_score']=default_min_score(values['topic'])
         if values['topic']!='ai' and values['editorial_brief']==DEFAULT_EDITORIAL_BRIEF:
             values['editorial_brief']=brief_for(values['topic'])
         values['channel_url']=values['channel_url'].strip()
@@ -578,7 +589,7 @@ def save_channel(item, cid=None):
                 raise HTTPException(400,'Сначала подтвердите результат неизвестной отправки в очереди')
             if not current or current['verified_chat_id']!=item.chat_id.strip():
                 raise HTTPException(400,'Сначала отправьте один пост вручную в этот Chat ID. Это проверит права бота.')
-        changed=current and (current['topic']!=values['topic'] or current['editorial_brief']!=item.editorial_brief or current['keywords']!=item.keywords or current['exclude_keywords']!=item.exclude_keywords or current['min_score']!=item.min_score)
+        changed=current and (current['topic']!=values['topic'] or current['editorial_brief']!=item.editorial_brief or current['keywords']!=item.keywords or current['exclude_keywords']!=item.exclude_keywords or current['min_score']!=values['min_score'])
         if changed:
             con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',ai_reason='Тематика канала изменена — нужна повторная оценка' WHERE channel_id=? AND status='draft'",(cid,))
         enabled_now=item.autopublish and (not current or not current['autopublish'])
