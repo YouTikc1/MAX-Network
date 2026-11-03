@@ -183,8 +183,8 @@ def test_publish_one_works_without_channel_enable_or_photo_checkbox(client,monke
     sends=[r for r in calls if r.url.host=='platform-api.max.ru']
     assert len(sends)==1
     body=json.loads(sends[0].content)
-    assert body['text'].startswith(COPY+'\n\n<a ') and 'Источник' not in body['text']
-    assert body['format']=='html' and 'https://max.ru/channel_neuropulse' in body['text']
+    assert body['text'].startswith('<b>'+COPY.replace('\n\n','</b>\n\n',1)+'\n\n<a ') and 'Источник' not in body['text']
+    assert body['format']=='html' and 'https://max.ru/channel_NeuroPulse' in body['text']
     assert body['attachments'][0]['payload']['url']=='https://news.example/photo.jpg'
 
 
@@ -278,7 +278,7 @@ def test_direct_publish_rechecks_bad_legacy_text(client,monkeypatch):
     calls=network(monkeypatch)
     assert client.post(f'/api/posts/{pid}/publish').status_code==200
     sent=[r for r in calls if r.url.host=='platform-api.max.ru']
-    assert json.loads(sent[0].content)['text'].startswith(COPY+'\n\n<a ')
+    assert json.loads(sent[0].content)['text'].startswith('<b>'+COPY.replace('\n\n','</b>\n\n',1)+'\n\n<a ')
 
 
 def test_concurrent_send_is_once(client,monkeypatch):
@@ -345,7 +345,7 @@ def test_old_schema_migration_preserves_actual_records(client,tmp_path,monkeypat
     monkeypatch.setattr(module,'DB',old)
     module.init();module.init()
     with module.db() as con:
-        assert con.execute('SELECT COUNT(*) FROM channels').fetchone()[0]==1
+        assert con.execute('SELECT COUNT(*) FROM channels').fetchone()[0]==5
         assert con.execute('SELECT name FROM channels').fetchone()[0]=='Мой канал'
         assert con.execute('SELECT COUNT(*) FROM sources').fetchone()[0]==1
         row=con.execute('SELECT * FROM posts').fetchone()
@@ -486,7 +486,7 @@ def test_expired_news_leaves_ready_reserve(client,monkeypatch):
 
 def test_primary_signature_is_correct_and_preserved_by_old_clients(client):
     channel=client.get('/api/channels').json()[0]
-    assert channel['channel_url']=='https://max.ru/channel_neuropulse'
+    assert channel['channel_url']=='https://max.ru/channel_NeuroPulse'
     assert channel['signature_text']=='NeuroPulse | Нейросети и ИИ'
     assert client.put('/api/channels/1',json={'name':'NeuroPulse','chat_id':'-123'}).status_code==200
     assert client.get('/api/channels').json()[0]['channel_url']==channel['channel_url']
@@ -583,3 +583,72 @@ def test_partial_retry_requires_explicit_removed_parts(client,monkeypatch):
     pid=post(status='uncertain',remote_ids=json.dumps(['already-published']))
     assert client.post(f'/api/posts/{pid}/resolve',json={'published':False}).status_code==409
     assert client.post(f'/api/posts/{pid}/resolve',json={'published':False,'parts_removed':True}).status_code==200
+
+
+def test_topic_presets_links_and_repeatable_migration(client):
+    before=client.get('/api/channels').json()
+    assert {c['topic'] for c in before}=={'ai','tech','finance','sport','business'}
+    for c in before:
+        assert c['channel_url'].startswith('https://max.ru/channel_')
+        assert not c['autopublish']
+    module.init()
+    assert client.get('/api/channels').json()==before
+
+
+@pytest.mark.parametrize('topic,title',[
+    ('finance','Банк снизил ключевую ставку'),
+    ('sport','Сборная выиграла чемпионат по футболу'),
+    ('business','Компания объявила сделку по поглощению'),
+    ('tech','Выпущен новый смартфон'),
+])
+def test_non_ai_topics_review_and_publish(client,monkeypatch,topic,title):
+    channel=next(c for c in client.get('/api/channels').json() if c['topic']==topic)
+    payload={**channel,'chat_id':'-123'}
+    assert client.put('/api/channels/'+str(channel['id']),json=payload).status_code==200
+    calls=network(monkeypatch)
+    verdict=asyncio.run(editorial.review(title,title+'. Подтверждены результаты события.',channel['editorial_brief'],topic=topic))
+    assert verdict.publishable
+    pid=post(channel_id=channel['id'],title=title,source_summary=title)
+    assert client.post(f'/api/posts/{pid}/publish').status_code==200
+    sent=json.loads(next(r for r in calls if r.url.host=='platform-api.max.ru').content)
+    assert channel['channel_url'] in sent['text']
+    assert sent['text'].startswith('<b>')
+
+
+def test_wrong_topic_blocked_even_with_approved_copy(client,monkeypatch):
+    channel=next(c for c in client.get('/api/channels').json() if c['topic']=='sport')
+    client.put('/api/channels/'+str(channel['id']),json={**channel,'chat_id':'-123'})
+    calls=network(monkeypatch)
+    pid=post(channel_id=channel['id'])
+    assert client.post(f'/api/posts/{pid}/publish').status_code==400
+    assert not any(r.url.host=='platform-api.max.ru' for r in calls)
+
+
+def test_headline_escaping_and_multiple_images():
+    from publication import message_payloads
+    parts=message_payloads('Новый <релиз> & тест\n\nТекст новости', 'https://max.ru/channel_TechPulse','TechPulse',
+        'https://news.example/a.jpg',['https://news.example/a.jpg','https://news.example/b.jpg'])
+    assert parts[0]['text'].startswith('<b>Новый &lt;релиз&gt; &amp; тест</b>\n\nТекст новости\n\n<a ')
+    assert len(parts[0]['attachments'])==2
+
+
+def test_rss_media_and_clear_images(client):
+    images=module.feed_images({'link':'https://news.example/story','summary':'<img src="/a.jpg"><img src="/b.jpg"><img src="/a.jpg">'})
+    assert images==['https://news.example/a.jpg','https://news.example/b.jpg']
+    pid=post(image_url=images[0],image_urls=json.dumps(images))
+    assert client.put(f'/api/posts/{pid}',json={'text':COPY,'image_url':''}).status_code==200
+    saved=next(p for p in client.get('/api/posts').json() if p['id']==pid)
+    assert json.loads(saved['image_urls'])==[]
+
+
+def test_discover_max_chat_ids(client,monkeypatch):
+    requests=[]
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200,json={'chats':[{'chat_id':-123,'title':'TechPulse','link':'https://max.ru/channel_TechPulse'}]})
+    monkeypatch.setattr(module.httpx,'AsyncClient',lambda *a,**kw:CLIENT(transport=httpx.MockTransport(handler),**kw))
+    result=client.get('/api/max/chats')
+    assert result.status_code==200 and result.json()['chats'][0]['chat_id']=='-123'
+    assert requests[0].method=='GET'
+    monkeypatch.setattr(module,'TOKEN','')
+    assert client.get('/api/max/chats').status_code==400

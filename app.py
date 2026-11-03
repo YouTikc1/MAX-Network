@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import calendar
 import json
+from topics import PROFILES, CHANNEL_URLS, brief_for, matches_topic
 from publication import message_payloads, valid_channel_url, PRIMARY_CHANNEL_URL, PRIMARY_SIGNATURE
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS, NEWS_REVISION, clean_post, is_ai_story
+from editorial import review, Verdict, EditorialUnavailable, text_hash, validate_copy, DEFAULT_EDITORIAL_BRIEF, LEGACY_BRIEFS, NEWS_REVISION, clean_post
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -57,6 +58,7 @@ def init():
         new_automation = 'verified_chat_id' not in channel_columns
         new_signature = 'channel_url' not in channel_columns
         channel_fields = {
+            'topic':"TEXT NOT NULL DEFAULT 'ai'",
             'channel_url':"TEXT NOT NULL DEFAULT ''",
             'signature_text':"TEXT NOT NULL DEFAULT ''",
             'editorial_brief': "TEXT NOT NULL DEFAULT '"+DEFAULT_EDITORIAL_BRIEF+"'",
@@ -72,6 +74,7 @@ def init():
         for name, definition in channel_fields.items():
             if name not in channel_columns: con.execute(f'ALTER TABLE channels ADD COLUMN {name} {definition}')
         post_fields = {
+            'image_urls':"TEXT NOT NULL DEFAULT '[]'",
             'ai_status': "TEXT NOT NULL DEFAULT 'pending'", 'ai_score': 'INTEGER',
             'ai_reason': "TEXT NOT NULL DEFAULT 'Ещё не проверено редактором'",
             'ai_text_hash': "TEXT NOT NULL DEFAULT ''", 'source_summary': "TEXT NOT NULL DEFAULT ''",
@@ -102,11 +105,30 @@ def init():
         if new_automation: con.execute('UPDATE channels SET autopublish=0')
         con.execute("UPDATE channels SET autopublish=0,automation_error='Прерванная отправка. Сначала проверьте канал MAX.',next_publish_at=NULL WHERE id IN (SELECT channel_id FROM posts WHERE status='publishing')")
         con.execute("UPDATE posts SET status='uncertain',error='Приложение завершилось во время отправки. Проверьте канал MAX.' WHERE status='publishing'")
-        if con.execute('SELECT COUNT(*) FROM channels').fetchone()[0]:
-            return
-        for cid, name in [(1,'Нейросети'),(2,'Технологии')]:
-            con.execute('INSERT OR IGNORE INTO channels(id,name,chat_id) VALUES (?,?,?)',(cid,name,os.getenv(f'MAX_CHAT_ID_{cid}','')))
-        if new_signature: con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE id=1 OR lower(name) LIKE 'neuropulse%'",(PRIMARY_CHANNEL_URL,PRIMARY_SIGNATURE))
+        existing=con.execute('SELECT COUNT(*) FROM channels').fetchone()[0]
+        if not existing:
+            for cid, name in [(1,'Нейросети'),(2,'Технологии')]:
+                con.execute('INSERT OR IGNORE INTO channels(id,name,chat_id) VALUES (?,?,?)',(cid,name,os.getenv(f'MAX_CHAT_ID_{cid}','')))
+            con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE id=1",(PRIMARY_CHANNEL_URL,PRIMARY_SIGNATURE))
+        # One-time additive presets; preserve existing channel settings and deleted presets.
+        con.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+        if not con.execute("SELECT 1 FROM settings WHERE key='pulse_profiles_v1'").fetchone():
+            for topic,(name,_,feeds) in PROFILES.items():
+                if topic=='ai': continue
+                current=con.execute('SELECT * FROM channels WHERE lower(name) LIKE ?',(name.split(' | ')[0].lower()+'%',)).fetchone()
+                if not current and topic=='tech':
+                    current=con.execute("SELECT * FROM channels WHERE name='Технологии' AND chat_id='' AND editorial_brief=?",(DEFAULT_EDITORIAL_BRIEF,)).fetchone()
+                if current:
+                    if current['name']=='Технологии' or (current['topic']=='ai' and current['editorial_brief']==DEFAULT_EDITORIAL_BRIEF):
+                        con.execute('UPDATE channels SET name=?,signature_text=?,topic=?,editorial_brief=? WHERE id=?',(name,name,topic,brief_for(topic),current['id']))
+                    continue
+                con.execute('INSERT INTO channels(name,signature_text,topic,editorial_brief) VALUES (?,?,?,?)',(name,name,topic,brief_for(topic)))
+            con.execute("INSERT INTO settings VALUES ('pulse_profiles_v1','1')")
+        if not con.execute("SELECT 1 FROM settings WHERE key='pulse_links_v1'").fetchone():
+            for topic,(name,_,_) in PROFILES.items():
+                con.execute("UPDATE channels SET channel_url=?,signature_text=? WHERE (lower(name) LIKE ? OR (id=1 AND name='Нейросети')) AND (channel_url='' OR channel_url=?)",(CHANNEL_URLS[topic],name,name.split(' | ')[0].lower()+'%',PRIMARY_CHANNEL_URL))
+            con.execute("INSERT INTO settings VALUES ('pulse_links_v1','1')")
+
 
 def auth(authorization: Optional[str] = Header(None)):
     if not PASSWORD or not authorization or not authorization.startswith('Basic '):
@@ -124,6 +146,7 @@ class SourceIn(BaseModel):
     url: str
 class ChannelIn(BaseModel):
     name: str
+    topic: str = 'ai'
     chat_id: str = ''
     channel_url: str = Field(default='',max_length=2048)
     signature_text: str = Field(default='',max_length=160)
@@ -172,7 +195,7 @@ def safe_image_url(url):
     except ValueError: pass
     return str(url).strip()[:2048]
 
-def feed_image(entry):
+def feed_images(entry):
     candidates=[]
     for item in entry.get('media_content',[]) + entry.get('media_thumbnail',[]):
         if isinstance(item,dict): candidates.append(item.get('url',''))
@@ -185,10 +208,14 @@ def feed_image(entry):
     # RSS feeds sometimes embed the lead image in the HTML summary/content.
     for block in [entry.get('summary', '')] + [x.get('value', '') for x in entry.get('content', []) if isinstance(x, dict)]:
         candidates.extend(html.unescape(m.group(1)) for m in re.finditer(r'<img\b[^>]*?\bsrc=[\"\']([^\"\']+)', block, re.I))
+    images=[]
     for url in candidates:
         checked=safe_image_url(urljoin(entry.get('link', ''), str(url or '')))
-        if checked: return checked
-    return ''
+        if checked and checked not in images: images.append(checked)
+    return images[:10]
+
+def feed_image(entry):
+    return next(iter(feed_images(entry)), '')
 
 def feed_summary(entry):
     blocks=[entry.get('summary','')]+[item.get('value','') for item in entry.get('content',[]) if isinstance(item,dict)]
@@ -214,6 +241,7 @@ def interesting(title, summary, channel):
     return not any(x in text for x in excluded) and (not included or any(x in text for x in included))
 
 def validate_channel(item):
+    if item.topic not in PROFILES: raise HTTPException(400,'Неизвестная тематика канала')
     if not item.name.strip() or len(item.name)>120: raise HTTPException(400,'Название: 1–120 символов')
     if item.chat_id and not re.fullmatch(r'-?\d+',item.chat_id.strip()): raise HTTPException(400,'Chat ID должен быть числом')
     if item.channel_url and not valid_channel_url(item.channel_url.strip()): raise HTTPException(400,'Подпись должна вести на публичную HTTPS-ссылку max.ru')
@@ -225,8 +253,8 @@ def validate_channel(item):
 def ensure_news_source(cid):
     with db() as con:
         ch=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone()
-        if ch and ch['editorial_brief']==DEFAULT_EDITORIAL_BRIEF and (cid==1 or ch['chat_id']):
-            con.executemany('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',[(cid,url) for url in NEWS_FEEDS])
+        if ch:
+            con.executemany('INSERT OR IGNORE INTO sources(channel_id,url) VALUES (?,?)',[(cid,url) for url in PROFILES[ch['topic']][2]])
 
 
 async def collect(channel_id, stats=None, stop_after_ready=False):
@@ -262,12 +290,12 @@ async def collect(channel_id, stats=None, stop_after_ready=False):
                             if stats is not None: stats['duplicates']+=1
                             continue
                         reason=None
-                        if not is_ai_story(title,summary): reason='Не новость об ИИ: основная тема не связана с искусственным интеллектом'
+                        if not matches_topic(title,summary,channel['topic']): reason='Материал не соответствует тематике канала'
                         elif not interesting(title,summary,channel): reason='Не соответствует фильтрам канала'
                         elif published and utcnow()-datetime.fromisoformat(published)>timedelta(hours=48): reason='Новость старше 48 часов'
                         state='rejected' if reason else 'pending'
-                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,source_summary,source_published_at,ai_status,ai_reason,ai_score,editorial_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                            (channel_id,title,title+'\n\n'+summary[:900],link,fingerprint,feed_image(entry),summary,published,state,reason or 'Ожидает проверки редактором',0 if reason else None,NEWS_REVISION))
+                        cur=con.execute('INSERT OR IGNORE INTO posts(channel_id,title,text,url,fingerprint,image_url,image_urls,source_summary,source_published_at,ai_status,ai_reason,ai_score,editorial_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (channel_id,title,title+'\n\n'+summary[:900],link,fingerprint,feed_image(entry),json.dumps(feed_images(entry)),summary,published,state,reason or 'Ожидает проверки редактором',0 if reason else None,NEWS_REVISION))
                         added+=cur.rowcount
                         if stats is not None:
                             stats['added']+=cur.rowcount
@@ -304,14 +332,13 @@ def automation_ready(channel, now):
 
 
 def auto_candidate(row,channel,now):
-    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): return False
+    if not matches_topic(row['title'] or '',row['source_summary'] or '',channel['topic']): return False
     if row['editorial_revision']!=NEWS_REVISION or not row['news_event'] or not row['news_evidence']: return False
     if not row['source_published_at']: return False
     if datetime.fromisoformat(row['source_published_at'])>now+timedelta(minutes=15): return False
     if row['ai_status']!='approved' or row['ai_score'] is None or row['ai_score']<channel['min_score']: return False
     if not interesting(row['title'] or '',row['source_summary'] or row['text'],channel): return False
     if row['ai_text_hash']!=text_hash(row['text']) or not row['reviewed_at'] or row['error']: return False
-    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): raise ValueError('Это не новость об ИИ — отправка заблокирована')
     if not validate_copy(clean_post(row['text'])): return False
     if now-datetime.fromisoformat(row['reviewed_at'])>timedelta(hours=24): return False
     created=datetime.fromisoformat(row['created_at'].replace(' ','T')).replace(tzinfo=timezone.utc)
@@ -344,12 +371,12 @@ async def _publish(post_id, automatic=False):
     if row['text'].startswith('⚠️ Требуется обработка ИИ'): raise ValueError('Сначала обработайте черновик через Ollama')
     if automatic and (not automation_ready(channel,now) or not auto_candidate(row,channel,now)):
         raise ValueError('Пост или расписание не прошли проверку автопубликации')
-    if not is_ai_story(row['title'] or '',row['source_summary'] or ''): raise ValueError('Это не новость об ИИ — отправка заблокирована')
+    if not matches_topic(row['title'] or '',row['source_summary'] or '',channel['topic']): raise ValueError('Материал не соответствует тематике канала — отправка заблокирована')
     if not validate_copy(clean_post(row['text'])):
         raise ValueError('Текст содержит инструкции, пересказ статьи или некорректный формат. Редактор подготовит новую версию.')
     if row['editorial_revision']!=NEWS_REVISION or row['ai_status']!='approved' or row['ai_text_hash']!=text_hash(row['text']) or not row['news_event'] or not row['news_evidence']:
         raise ValueError('Редактор ещё проверяет новость. Непроверенный текст отправлен не будет.')
-    payloads=message_payloads(clean_post(row['text']),channel['channel_url'],channel['signature_text'] or channel['name'],row['image_url'] or '')
+    payloads=message_payloads(clean_post(row['text']),channel['channel_url'],channel['signature_text'] or channel['name'],row['image_url'] or '',json.loads(row['image_urls']) if row['image_url'] else [])
     with db() as con:
         # Durable claim prevents retries after a restart or another worker.
         cur=con.execute("UPDATE posts SET status='publishing',remote_ids='[]',remote_id=NULL,publish_mode=?,published_chat_id=? WHERE id=? AND status='draft'",
@@ -463,6 +490,18 @@ app.mount('/static',StaticFiles(directory=Path(__file__).with_name('static')),na
 def home(_=Depends(auth)):
     return Path(__file__).with_name('templates').joinpath('index.html').read_text(encoding='utf-8')
 
+@app.get('/api/max/chats',dependencies=[Depends(auth)])
+async def max_chats():
+    if not TOKEN: raise HTTPException(400,'Сначала настройте MAX_TOKEN в окружении сервера и добавьте бота в каналы администратором')
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response=await client.get(API+'/chats',headers={'Authorization':TOKEN},params={'count':100})
+            response.raise_for_status()
+            data=response.json()
+        return {'chats':[{'chat_id':str(chat['chat_id']),'title':chat.get('title',''),'link':chat.get('link','')} for chat in data.get('chats',[])], 'marker':data.get('marker')}
+    except (httpx.HTTPError,ValueError,KeyError):
+        raise HTTPException(502,'Не удалось получить каналы MAX. Проверьте токен и доступ бота.')
+
 @app.get('/api/channels',dependencies=[Depends(auth)])
 def channels():
     with db() as con: return [dict(x) for x in con.execute('SELECT * FROM channels')]
@@ -474,8 +513,10 @@ def save_channel(item, cid=None):
         current=con.execute('SELECT * FROM channels WHERE id=?',(cid,)).fetchone() if cid else None
         if cid and not current: raise HTTPException(404,'Канал не найден')
         if current:
-            for field in ('channel_url','signature_text'):
+            for field in ('channel_url','signature_text','topic'):
                 if field not in item.model_fields_set: values[field]=current[field]
+        if values['topic']!='ai' and values['editorial_brief']==DEFAULT_EDITORIAL_BRIEF:
+            values['editorial_brief']=brief_for(values['topic'])
         values['channel_url']=values['channel_url'].strip()
         values['signature_text']=values['signature_text'].strip()
         if item.autopublish:
@@ -484,7 +525,7 @@ def save_channel(item, cid=None):
                 raise HTTPException(400,'Сначала подтвердите результат неизвестной отправки в очереди')
             if not current or current['verified_chat_id']!=item.chat_id.strip():
                 raise HTTPException(400,'Сначала отправьте один пост вручную в этот Chat ID. Это проверит права бота.')
-        changed=current and (current['editorial_brief']!=item.editorial_brief or current['keywords']!=item.keywords or current['exclude_keywords']!=item.exclude_keywords or current['min_score']!=item.min_score)
+        changed=current and (current['topic']!=values['topic'] or current['editorial_brief']!=item.editorial_brief or current['keywords']!=item.keywords or current['exclude_keywords']!=item.exclude_keywords or current['min_score']!=item.min_score)
         if changed:
             con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',ai_reason='Тематика канала изменена — нужна повторная оценка' WHERE channel_id=? AND status='draft'",(cid,))
         enabled_now=item.autopublish and (not current or not current['autopublish'])
@@ -568,9 +609,13 @@ async def edit_post(pid:int,item:dict):
     with db() as con:
         row=con.execute("SELECT * FROM posts WHERE id=? AND status='draft'",(pid,)).fetchone()
         if not row: raise HTTPException(400,'Редактировать можно только черновики')
+        images=item.get('image_urls',json.loads(row['image_urls']) if image_url==row['image_url'] else [])
+        if not isinstance(images,list) or len(images)>10 or any(not isinstance(url,str) or not safe_image_url(url) for url in images):
+            raise HTTPException(400,'Укажите не более 10 публичных HTTPS URL изображений')
+        if not image_url: images=[]
         changed=value!=row['text']
-        con.execute("UPDATE posts SET text=?,image_url=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,user_edited=?,error=NULL WHERE id=?",
-            (value,image_url,approved,'pending' if changed else row['ai_status'],'' if changed else row['ai_text_hash'],
+        con.execute("UPDATE posts SET text=?,image_url=?,image_urls=?,image_approved=?,ai_status=?,ai_text_hash=?,ai_reason=?,user_edited=?,error=NULL WHERE id=?",
+            (value,image_url,json.dumps(images),approved,'pending' if changed else row['ai_status'],'' if changed else row['ai_text_hash'],
              'Текст проверяется редактором автоматически' if changed else row['ai_reason'],int(changed or row['user_edited']),pid))
     if changed: queue_review()
     return {'ok':True}
@@ -620,7 +665,7 @@ async def rewrite_post(pid:int):
         if not interesting(row['title'] or '',context,channel):
             verdict=Verdict(publishable=False,score=0,reason='Не соответствует ключевым словам или исключающим фильтрам канала',text='')
         else:
-            verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None)
+            verdict=await review(row['title'],context,channel['editorial_brief'],draft=clean_post(row['text']) if row['user_edited'] else None,topic=channel['topic'])
     except EditorialUnavailable as exc:
         with db() as con:
             con.execute("UPDATE posts SET ai_status='pending',ai_text_hash='',ai_reason=?,review_attempts=review_attempts+1,review_kind=?,review_after=? WHERE id=? AND status='draft'",
